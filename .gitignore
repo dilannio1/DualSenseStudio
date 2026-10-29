@@ -1,0 +1,9 @@
+dist/
+build/
+__pycache__/
+*.spec
+*.log
+perfiles_dualsense.json
+juegos_perfiles.json
+studio_settings.json
+*.bak
