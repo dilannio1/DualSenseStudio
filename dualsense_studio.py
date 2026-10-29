@@ -62,7 +62,68 @@ import re
 APP_VERSION = "v2.7"
 # Etiqueta de esta compilación (se muestra en el título): se sube en cada
 # entrega para saber qué build está corriendo.
-BUILD_TAG = "reportes-debug"
+BUILD_TAG = "ota-v1"
+
+# Actualizaciones OTA (GitHub Releases). El tag del Release (v0.1.0, v0.1.1...)
+# se compara con OTA_VERSION: hay que subir OTA_VERSION en cada entrega.
+OTA_VERSION = "0.1.0"
+OTA_REPO = "dilannio1/DualSenseStudio"
+OTA_ASSET_NAME = "DualSenseStudio.exe"
+OTA_RELEASES_URL = "https://api.github.com/repos/dilannio1/DualSenseStudio/releases/latest"
+OTA_IDLE_SECONDS = 5.0
+OTA_SNOOZE_SECONDS = 24 * 3600
+
+
+def _ota_parse_version(tag):
+    """'v0.1.1' -> (0, 1, 1). None si el tag no es numérico."""
+    try:
+        t = str(tag).strip()
+        if t.lower().startswith("v"):
+            t = t[1:]
+        return tuple(int(p) for p in t.split("."))
+    except Exception:
+        return None
+
+
+def _ota_is_newer(latest_tag, current):
+    """True si latest_tag es una versión mayor que current."""
+    lat = _ota_parse_version(latest_tag)
+    cur = _ota_parse_version(current)
+    if lat is None or cur is None:
+        return False
+    n = max(len(lat), len(cur))
+    lat += (0,) * (n - len(lat))
+    cur += (0,) * (n - len(cur))
+    return lat > cur
+
+
+def _ota_snooze_active(until, version, tag, now):
+    """True si el 'Después' sigue vigente para ESTA versión."""
+    try:
+        return bool(until) and float(until) > now and version == tag
+    except Exception:
+        return False
+
+
+def _ota_updater_script(exe_path, new_path, proc_name):
+    """Script .bat que espera a que la app cierre, reemplaza el .exe
+    (reintenta hasta 30s por si el archivo sigue bloqueado), relanza
+    la app y se borra solo."""
+    lines = [
+        "@echo off",
+        "REM Actualizador de DualSense Studio: reemplaza el exe y relanza.",
+        "set \"intentos=0\"",
+        ":espera",
+        f'tasklist /FI "IMAGENAME eq {proc_name}" 2>nul | find /I "{proc_name}" >nul',
+        "if not errorlevel 1 ( timeout /t 1 /nobreak >nul & goto espera )",
+        ":reemplazo",
+        f'move /Y "{new_path}" "{exe_path}" >nul 2>&1',
+        f'if exist "{new_path}" ( set /a intentos+=1 & if %intentos% GEQ 30 goto fin & timeout /t 1 /nobreak >nul & goto reemplazo )',
+        ":fin",
+        f'start "" "{exe_path}"',
+        'del "%~f0"',
+    ]
+    return "\r\n".join(lines) + "\r\n"
 
 
 def _check_dependencies():
@@ -1056,11 +1117,17 @@ class DualSenseStudioApp(ctk.CTk):
         self.after(1500, self._try_auto_connect)
         # Detección de juegos: revisa cada 1s (proceso activo o ventana al frente)
         self.after(1000, self._game_detect_tick)
+        # Actualizaciones: primer chequeo a los 10s (en hilo, nunca frena la UI)
+        self.after(10000, lambda: self._ota_check_in_background(False))
 
     def _game_detect_tick(self):
         """Tick periódico (hilo principal) para el perfil automático por juego."""
         try:
             self._check_game_detection()
+        except Exception:
+            pass
+        try:
+            self._ota_prompt_if_idle()
         except Exception:
             pass
         self.after(1000, self._game_detect_tick)
@@ -2199,12 +2266,284 @@ class DualSenseStudioApp(ctk.CTk):
         ctk.CTkButton(btn_row, text="Cancelar", width=120, fg_color="#475569",
                       command=dialog.destroy).pack(side="left", padx=8)
 
+    # ======================================================================
+    # ACTUALIZACIONES OTA (GitHub Releases): aviso + botón, el usuario
+    # decide. Nunca automático, nunca en partida: el aviso solo sale con
+    # 5s seguidos sin ningún juego mapeado corriendo. "Después" pospone
+    # 24h ESA versión. Mientras el repo sea privado, el chequeo necesita
+    # github_token.txt (token de solo lectura para este repo) junto al
+    # .exe; al hacer el repo público, ese archivo puede borrarse.
+    # ======================================================================
+    def _ota_token(self):
+        try:
+            with open(os.path.join(BASE_DIR, "github_token.txt"), "r", encoding="utf-8") as f:
+                tok = f.read().strip()
+            return tok or None
+        except Exception:
+            return None
+
+    def _ota_check_in_background(self, manual=False):
+        import threading
+        if getattr(self, "_ota_checking", False):
+            return
+        self._ota_checking = True
+
+        def _work():
+            info = None
+            try:
+                info = self._ota_fetch_latest()
+            except Exception:
+                info = None
+            finally:
+                self._ota_checking = False
+            try:
+                self.after(0, lambda: self._ota_on_check_result(info, manual))
+            except Exception:
+                pass
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _ota_fetch_latest(self):
+        import urllib.request
+        req = urllib.request.Request(OTA_RELEASES_URL, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "DualSenseStudio",
+        })
+        tok = self._ota_token()
+        if tok:
+            req.add_header("Authorization", "Bearer " + tok)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        tag = str(data.get("tag_name") or "")
+        if not tag:
+            return None
+        asset_url = None
+        sha_url = None
+        for a in data.get("assets") or []:
+            if a.get("name") == OTA_ASSET_NAME:
+                asset_url = a.get("url")
+            elif a.get("name") == OTA_ASSET_NAME + ".sha256":
+                sha_url = a.get("url")
+        if not asset_url:
+            return None
+        return {"tag": tag, "asset_url": asset_url, "sha_url": sha_url}
+
+    def _ota_on_check_result(self, info, manual=False):
+        try:
+            if info is not None:
+                tag = info.get("tag")
+                if _ota_is_newer(tag, OTA_VERSION):
+                    if getattr(self, "_ota_available", None) is None or getattr(self, "_ota_available").get("tag") != tag:
+                        self._ota_prompted_key = None
+                    self._ota_available = info
+                else:
+                    self._ota_available = None
+            self._ota_refresh_settings_ui()
+            if manual:
+                if getattr(self, "_ota_available", None):
+                    self._ota_show_prompt(self._ota_available)
+                elif info is not None:
+                    self.show_alert("Estás al día", f"Ya tienes la última versión ({OTA_VERSION}).")
+                else:
+                    self.show_alert("No se pudo buscar", "No se pudo contactar GitHub. Revisa tu internet (si el repo es privado, falta github_token.txt junto al .exe).")
+        except Exception:
+            pass
+
+    def _ota_refresh_settings_ui(self):
+        try:
+            lbl = getattr(self, "_ota_settings_status", None)
+            if lbl is not None and lbl.winfo_exists():
+                info = getattr(self, "_ota_available", None)
+                if info:
+                    lbl.configure(text=f"Versión instalada: {OTA_VERSION}  •  Disponible: {info.get('tag')}")
+                else:
+                    lbl.configure(text=f"Versión instalada: {OTA_VERSION}  •  Al día")
+            btn = getattr(self, "_ota_install_btn", None)
+            if btn is not None and btn.winfo_exists():
+                btn.configure(state="normal" if getattr(self, "_ota_available", None) else "disabled")
+        except Exception:
+            pass
+
+    def _ota_prompt_if_idle(self):
+        """Aviso de actualización solo en idle: 5s seguidos sin ningún
+        juego mapeado corriendo. Nunca sale sobre una partida."""
+        try:
+            info = getattr(self, "_ota_available", None)
+            if not info:
+                return
+            tag = info.get("tag")
+            if not tag or not _ota_is_newer(tag, OTA_VERSION):
+                return
+            if _ota_snooze_active(getattr(self, "_update_snooze_until", 0),
+                                  getattr(self, "_update_snooze_version", ""),
+                                  tag, time.time()):
+                return
+            old = getattr(self, "_ota_prompt_win", None)
+            if old is not None:
+                try:
+                    if old.winfo_exists():
+                        return
+                except Exception:
+                    pass
+                self._ota_prompt_win = None
+            names = getattr(self, "_last_seen_process_names", None)
+            if names is None:
+                return
+            now = time.time()
+            if any(exe in names for exe in self.game_profiles):
+                self._update_idle_since = None
+                return
+            if getattr(self, "_update_idle_since", None) is None:
+                self._update_idle_since = now
+                return
+            if now - self._update_idle_since < OTA_IDLE_SECONDS:
+                return
+            key = (self._update_idle_since, tag)
+            if getattr(self, "_ota_prompted_key", None) == key:
+                return
+            self._ota_prompted_key = key
+            self.after(0, lambda: self._ota_show_prompt(info))
+        except Exception:
+            pass
+
+    def _ota_show_prompt(self, info):
+        try:
+            old = getattr(self, "_ota_prompt_win", None)
+            if old is not None:
+                try:
+                    if old.winfo_exists():
+                        return
+                except Exception:
+                    pass
+            tag = info.get("tag")
+            win = ctk.CTkToplevel(self)
+            win.title("Actualización disponible")
+            win.geometry("380x190")
+            win.resizable(False, False)
+            win.transient(self)
+            win.attributes("-topmost", True)
+            ctk.CTkLabel(win, text="Actualización disponible", font=("Segoe UI", 14, "bold")).pack(pady=(16, 4))
+            ctk.CTkLabel(win, text=f"Hay una versión nueva ({tag}).\n¿Quieres instalarla ahora?",
+                         font=("Segoe UI", 12), justify="center").pack(pady=4)
+            row = ctk.CTkFrame(win, fg_color="transparent")
+            row.pack(pady=(10, 14))
+            ctk.CTkButton(row, text="Actualizar ahora", width=150, height=34, corner_radius=8, fg_color="#16a34a",
+                          command=lambda: (self._ota_close_prompt(), self._ota_start_install(info))).pack(side="left", padx=6)
+            ctk.CTkButton(row, text="Después", width=120, height=34, corner_radius=8, fg_color="#475569",
+                          command=lambda: self._ota_snooze(tag)).pack(side="left", padx=6)
+            win.protocol("WM_DELETE_WINDOW", lambda: self._ota_snooze(tag))
+            self._ota_prompt_win = win
+        except Exception:
+            pass
+
+    def _ota_close_prompt(self):
+        try:
+            win = getattr(self, "_ota_prompt_win", None)
+            self._ota_prompt_win = None
+            if win is not None:
+                win.destroy()
+        except Exception:
+            pass
+
+    def _ota_snooze(self, tag):
+        try:
+            self._update_snooze_until = time.time() + OTA_SNOOZE_SECONDS
+            self._update_snooze_version = str(tag)
+            data = {}
+            try:
+                if os.path.exists(SETTINGS_FILE):
+                    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f) or {}
+            except Exception:
+                data = {}
+            data["update_snooze_until"] = self._update_snooze_until
+            data["update_snooze_version"] = self._update_snooze_version
+            self._atomic_json_write(SETTINGS_FILE, data)
+        except Exception:
+            pass
+        self._ota_close_prompt()
+
+    def _ota_install_from_settings(self, dialog):
+        info = getattr(self, "_ota_available", None)
+        if not info:
+            self.show_alert("Sin actualización", "No hay ninguna actualización disponible.")
+            return
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+        self._ota_start_install(info)
+
+    def _ota_start_install(self, info):
+        import threading
+        if not getattr(sys, "frozen", False):
+            self.show_alert("Solo .exe", "La actualización automática solo funciona con el .exe compilado, no desde el .py.")
+            return
+        self._ota_close_prompt()
+        self.show_alert("Descargando", f"Descargando la versión {info.get('tag')}... La app se cerrará sola al terminar.")
+
+        def _work():
+            try:
+                self._ota_download_and_install(info)
+            except Exception as e:
+                try:
+                    self.after(0, lambda: self.show_alert("No se pudo actualizar", f"Error al descargar:\n{e}"))
+                except Exception:
+                    pass
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _ota_download_and_install(self, info):
+        import urllib.request
+        import hashlib
+        import subprocess
+        exe_path = os.path.abspath(sys.executable)
+        new_path = exe_path + ".new"
+        tok = self._ota_token()
+        req = urllib.request.Request(info["asset_url"], headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "DualSenseStudio",
+        })
+        if tok:
+            req.add_header("Authorization", "Bearer " + tok)
+        h = hashlib.sha256()
+        total = 0
+        with urllib.request.urlopen(req, timeout=60) as resp, open(new_path, "wb") as out:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+                total += len(chunk)
+                out.write(chunk)
+        if total < 1000000:
+            raise RuntimeError("Descarga incompleta (archivo demasiado chico).")
+        sha_url = info.get("sha_url")
+        if sha_url:
+            req2 = urllib.request.Request(sha_url, headers={
+                "Accept": "application/octet-stream",
+                "User-Agent": "DualSenseStudio",
+            })
+            if tok:
+                req2.add_header("Authorization", "Bearer " + tok)
+            with urllib.request.urlopen(req2, timeout=15) as resp:
+                expected = resp.read().decode("utf-8", "ignore").split()[0].strip().lower()
+            if expected and h.hexdigest() != expected:
+                raise RuntimeError("La descarga no pasó la verificación (hash distinto).")
+        bat_path = os.path.join(BASE_DIR, "actualizar_dualsense.bat")
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(_ota_updater_script(exe_path, new_path, os.path.basename(exe_path)))
+        try:
+            subprocess.Popen(["cmd", "/c", bat_path],
+                             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        except Exception:
+            subprocess.Popen(["cmd", "/c", bat_path])
+        self.after(0, lambda: self.quit_app())
+
     def _open_settings_dialog(self):
         """Sección Ajustes: copias de seguridad y restauración. Mismo
         lenguaje visual que el diálogo de renombrar (sin grab, topmost)."""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Ajustes")
-        dialog.geometry("400x260")
+        dialog.geometry("400x380")
         dialog.transient(self)
         dialog.attributes("-topmost", True)
         # Sin grab: así los avisos (show_alert) siguen siendo clicables.
@@ -2223,6 +2562,21 @@ class DualSenseStudioApp(ctk.CTk):
         ctk.CTkButton(dialog, text="Restaurar copias de seguridad", width=240, height=32,
                       corner_radius=8, fg_color="#475569",
                       command=lambda: self._restore_backups(dialog)).pack(pady=10)
+
+        ctk.CTkLabel(dialog, text="Actualizaciones", font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=20, pady=(6, 0))
+        self._ota_settings_status = ctk.CTkLabel(dialog, text=f"Versión instalada: {OTA_VERSION}",
+                                                 font=("Segoe UI", 11), text_color="#64748b", wraplength=340)
+        self._ota_settings_status.pack(anchor="w", padx=20)
+        _ota_btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        _ota_btn_row.pack(pady=6)
+        ctk.CTkButton(_ota_btn_row, text="Buscar actualizaciones", width=170, height=32, corner_radius=8,
+                      fg_color="#475569", command=lambda: self._ota_check_in_background(True)).pack(side="left", padx=(0, 6))
+        self._ota_install_btn = ctk.CTkButton(_ota_btn_row, text="Instalar actualización", width=170, height=32,
+                                              corner_radius=8, fg_color="#16a34a",
+                                              command=lambda: self._ota_install_from_settings(dialog))
+        self._ota_install_btn.pack(side="left")
+        self._ota_refresh_settings_ui()
+
         ctk.CTkButton(dialog, text="Cerrar", width=130, height=32, corner_radius=8,
                       fg_color="#3b82f6", command=dialog.destroy).pack(pady=(0, 14))
 
@@ -3168,6 +3522,7 @@ class DualSenseStudioApp(ctk.CTk):
         # si el aplicado murió pero otro mapeado vive, se cambia a ese sin
         # soltar el perfil (el hueco de ~1s entre ambos no revierte nada).
         _names = self._running_process_names()
+        self._last_seen_process_names = _names
         if not self._last_auto_game or self._last_auto_game not in _names:
             for _exe in self.game_profiles:
                 if _exe in _names:
@@ -3486,6 +3841,8 @@ class DualSenseStudioApp(ctk.CTk):
     def load_settings(self):
         self._settings_touchpad_mouse = False
         self._settings_backup = True
+        self._update_snooze_until = 0.0
+        self._update_snooze_version = ""
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -3493,6 +3850,11 @@ class DualSenseStudioApp(ctk.CTk):
                 if data.get("touchpad_mouse", False):
                     self._settings_touchpad_mouse = True
                 self._settings_backup = bool(data.get("backup_enabled", True))
+                try:
+                    self._update_snooze_until = float(data.get("update_snooze_until") or 0)
+                except Exception:
+                    self._update_snooze_until = 0.0
+                self._update_snooze_version = str(data.get("update_snooze_version") or "")
                 lb = data.get("lightbar")
                 if isinstance(lb, (list, tuple)) and len(lb) == 3:
                     return [max(0, min(255, int(c))) for c in lb]
