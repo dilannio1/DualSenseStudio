@@ -62,11 +62,13 @@ import re
 APP_VERSION = "v2.7"
 # Etiqueta de esta compilación (se muestra en el título): se sube en cada
 # entrega para saber qué build está corriendo.
-BUILD_TAG = "ota-v2"
+BUILD_TAG = "ota-v3"
 
 # Actualizaciones OTA (GitHub Releases). El tag del Release (v0.1.0, v0.1.1...)
-# se compara con OTA_VERSION: hay que subir OTA_VERSION en cada entrega.
-OTA_VERSION = "0.1.0"
+# se compara con OTA_VERSION. REGLA: cada cambio sube OTA_VERSION sin
+# excepción — si el exe lleva una versión menor que el tag, la OTA lo
+# ofrece en bucle; si lleva una mayor, nunca lo ofrece.
+OTA_VERSION = "0.1.1"
 OTA_REPO = "dilannio1/DualSenseStudio"
 OTA_ASSET_NAME = "DualSenseStudio.exe"
 OTA_RELEASES_URL = "https://api.github.com/repos/dilannio1/DualSenseStudio/releases/latest"
