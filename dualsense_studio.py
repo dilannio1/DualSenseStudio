@@ -62,7 +62,7 @@ import re
 APP_VERSION = "v2.7"
 # Etiqueta de esta compilación (se muestra en el título): se sube en cada
 # entrega para saber qué build está corriendo.
-BUILD_TAG = "ota-v1"
+BUILD_TAG = "ota-v2"
 
 # Actualizaciones OTA (GitHub Releases). El tag del Release (v0.1.0, v0.1.1...)
 # se compara con OTA_VERSION: hay que subir OTA_VERSION en cada entrega.
@@ -1968,16 +1968,32 @@ class DualSenseStudioApp(ctk.CTk):
                             f"Descarga: {HIDHIDE_URL}\n\n"
                             "La app sigue funcionando sin anti doble-input.")
 
-    def show_alert(self, title, message):
-        dialog = ctk.CTkToplevel(self)
+    def show_alert(self, title, message, parent=None):
+        """Aviso pequeño. `parent` es la ventana que lo abrió (p. ej. el
+        diálogo de Ajustes): el aviso se hace transient de ella y se trae
+        al frente, para que nunca quede detrás del diálogo que lo disparó."""
+        owner = self
+        try:
+            if parent is not None and parent.winfo_exists():
+                owner = parent
+        except Exception:
+            owner = self
+        dialog = ctk.CTkToplevel(owner)
         dialog.title(title)
         dialog.geometry("380x220")
         dialog.resizable(False, False)
+        dialog.transient(owner)
         dialog.attributes("-topmost", True)
 
         ctk.CTkLabel(dialog, text=title, font=("Segoe UI", 14, "bold"), text_color="#f87171").pack(pady=(16, 4))
         ctk.CTkLabel(dialog, text=message, font=("Segoe UI", 12), justify="center", wraplength=340).pack(pady=4)
         ctk.CTkButton(dialog, text="Entendido", width=100, command=dialog.destroy, fg_color="#3b82f6").pack(pady=(12, 16))
+        try:
+            dialog.update_idletasks()
+            dialog.lift()
+            dialog.focus_force()
+        except Exception:
+            pass
 
     def _on_profile_selected_manual(self, profile_name):
         """El usuario eligió un perfil manual: cancela el modo auto-juego."""
@@ -2329,6 +2345,13 @@ class DualSenseStudioApp(ctk.CTk):
 
     def _ota_on_check_result(self, info, manual=False):
         try:
+            parent = None
+            try:
+                dlg = getattr(self, "_settings_dialog", None)
+                if dlg is not None and dlg.winfo_exists():
+                    parent = dlg
+            except Exception:
+                parent = None
             if info is not None:
                 tag = info.get("tag")
                 if _ota_is_newer(tag, OTA_VERSION):
@@ -2342,9 +2365,9 @@ class DualSenseStudioApp(ctk.CTk):
                 if getattr(self, "_ota_available", None):
                     self._ota_show_prompt(self._ota_available)
                 elif info is not None:
-                    self.show_alert("Estás al día", f"Ya tienes la última versión ({OTA_VERSION}).")
+                    self.show_alert("Estás al día", f"Ya tienes la última versión ({OTA_VERSION}).", parent=parent)
                 else:
-                    self.show_alert("No se pudo buscar", "No se pudo contactar GitHub. Revisa tu internet (si el repo es privado, falta github_token.txt junto al .exe).")
+                    self.show_alert("No se pudo buscar", "No se pudo contactar GitHub. Revisa tu internet (si el repo es privado, falta github_token.txt junto al .exe).", parent=parent)
         except Exception:
             pass
 
@@ -2431,6 +2454,12 @@ class DualSenseStudioApp(ctk.CTk):
             ctk.CTkButton(row, text="Después", width=120, height=34, corner_radius=8, fg_color="#475569",
                           command=lambda: self._ota_snooze(tag)).pack(side="left", padx=6)
             win.protocol("WM_DELETE_WINDOW", lambda: self._ota_snooze(tag))
+            try:
+                win.update_idletasks()
+                win.lift()
+                win.focus_force()
+            except Exception:
+                pass
             self._ota_prompt_win = win
         except Exception:
             pass
@@ -2546,6 +2575,17 @@ class DualSenseStudioApp(ctk.CTk):
         dialog.geometry("400x380")
         dialog.transient(self)
         dialog.attributes("-topmost", True)
+        self._settings_dialog = dialog
+        def _close_settings():
+            try:
+                self._settings_dialog = None
+            except Exception:
+                pass
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+        dialog.protocol("WM_DELETE_WINDOW", _close_settings)
         # Sin grab: así los avisos (show_alert) siguen siendo clicables.
         ctk.CTkLabel(dialog, text="Ajustes", font=("Segoe UI", 14, "bold")).pack(pady=(16, 4))
         ctk.CTkLabel(dialog, text="Cada guardado escribe a un archivo temporal y lo renombra (un corte no corrompe nada) y, si las copias están activadas, guarda antes una copia .bak del archivo anterior.",
@@ -2578,7 +2618,7 @@ class DualSenseStudioApp(ctk.CTk):
         self._ota_refresh_settings_ui()
 
         ctk.CTkButton(dialog, text="Cerrar", width=130, height=32, corner_radius=8,
-                      fg_color="#3b82f6", command=dialog.destroy).pack(pady=(0, 14))
+                      fg_color="#3b82f6", command=_close_settings).pack(pady=(0, 14))
 
     def _on_backup_toggle(self, switch):
         try:
@@ -2595,7 +2635,7 @@ class DualSenseStudioApp(ctk.CTk):
         import shutil
         found = [p for p in (PROFILES_FILE, GAME_PROFILES_FILE) if os.path.exists(p + ".bak")]
         if not found:
-            self.show_alert("Sin copias", "No hay copias .bak para restaurar.")
+            self.show_alert("Sin copias", "No hay copias .bak para restaurar.", parent=dialog)
             return
         names = ", ".join(os.path.basename(p) for p in found)
         if not msgbox.askyesno("Restaurar copias",
@@ -2611,9 +2651,9 @@ class DualSenseStudioApp(ctk.CTk):
                 self.load_profile_to_ui(self.current_profile_name)
                 self.profile_combo.set(self.current_profile_name)
             self.refresh_game_list_ui()
-            self.show_alert("Copias restauradas", f"Restaurado desde: {names}.")
+            self.show_alert("Copias restauradas", f"Restaurado desde: {names}.", parent=dialog)
         except Exception as e:
-            self.show_alert("No se pudo restaurar", f"Error al restaurar:\n{e}")
+            self.show_alert("No se pudo restaurar", f"Error al restaurar:\n{e}", parent=dialog)
             return
         if dialog is not None:
             try:
