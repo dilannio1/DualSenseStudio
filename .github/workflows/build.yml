@@ -1,0 +1,99 @@
+name: Build exe
+
+# Compila DualSenseStudio.exe en un Windows de GitHub y lo deja listo:
+# - Al crear un tag v* (p. ej. v0.1.1): compila y sube el exe al release
+#   en borrador (draft). Pedro lo publica a mano.
+# - Manual (Actions -> Run workflow): compila y guarda el exe como
+#   artefacto; si se pasa un tag, además lo sube al release en borrador.
+# El número de versión va por dentro (OTA_VERSION) y TIENE que ser igual
+# al tag: el paso "Revisar versión" tumba el build si no coinciden.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag del release al que se sube el exe (vacío = solo artefacto, sin release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Bajar el código
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Revisar que el icono esté en el repo
+        shell: pwsh
+        run: |
+          if (!(Test-Path valdomero.ico)) {
+            Write-Error "Falta valdomero.ico en el repo. Súbelo por la web (Add file -> Upload files) y vuelve a correr el workflow."
+            exit 1
+          }
+
+      - name: Resolver el tag
+        id: tag
+        shell: pwsh
+        run: |
+          $t = ""
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") { $t = "${{ inputs.tag }}" }
+          elseif ("${{ github.ref_type }}" -eq "tag") { $t = "${{ github.ref_name }}" }
+          Add-Content $env:GITHUB_OUTPUT "tag=$t"
+
+      - name: Revisar que la versión de adentro sea igual al tag
+        if: steps.tag.outputs.tag != ''
+        shell: pwsh
+        run: |
+          $m = Select-String -Path dualsense_studio.py -Pattern 'OTA_VERSION = "([^"]+)"'
+          $ver = $m.Matches.Groups[1].Value
+          $tag = "${{ steps.tag.outputs.tag }}".TrimStart("v")
+          if ($ver -ne $tag) {
+            Write-Error "OTA_VERSION ($ver) no es igual al tag ($tag). Sube OTA_VERSION en el código antes de compilar."
+            exit 1
+          }
+          Write-Host "Versión OK: $ver = tag $tag"
+
+      - name: Instalar dependencias fijas
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compilar el exe
+        run: python -m PyInstaller --onefile --windowed --uac-admin --icon=valdomero.ico --name "DualSenseStudio" --collect-all customtkinter --collect-all vgamepad --hidden-import win32gui --hidden-import win32process --hidden-import win32api --hidden-import win32ui --hidden-import win32con --hidden-import pywintypes --hidden-import pythoncom --hidden-import psutil --add-data "valdomero.ico;." dualsense_studio.py
+
+      - name: Revisar que el exe exista
+        shell: pwsh
+        run: |
+          $exe = Get-Item dist\DualSenseStudio.exe
+          if ($exe.Length -lt 1000000) { Write-Error "El exe salió demasiado chico."; exit 1 }
+          Write-Host "Exe OK: $($exe.Length) bytes"
+
+      - name: Guardar el exe como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: DualSenseStudio-exe
+          path: dist/DualSenseStudio.exe
+          if-no-files-found: error
+
+      - name: Subir el exe al release (borrador)
+        if: steps.tag.outputs.tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.tag.outputs.tag }}"
+          gh release view $tag --json tagName 2>$null
+          if ($LASTEXITCODE -ne 0) { gh release create $tag --draft --title $tag --notes "Build automático." }
+          gh release upload $tag dist\DualSenseStudio.exe --clobber
