@@ -68,7 +68,7 @@ BUILD_TAG = "ota-v3"
 # se compara con OTA_VERSION. REGLA: cada cambio sube OTA_VERSION sin
 # excepción — si el exe lleva una versión menor que el tag, la OTA lo
 # ofrece en bucle; si lleva una mayor, nunca lo ofrece.
-OTA_VERSION = "0.1.2"
+OTA_VERSION = "0.1.4"
 OTA_REPO = "dilannio1/DualSenseStudio"
 OTA_ASSET_NAME = "DualSenseStudio.exe"
 OTA_RELEASES_URL = "https://api.github.com/repos/dilannio1/DualSenseStudio/releases/latest"
@@ -2008,8 +2008,40 @@ class DualSenseStudioApp(ctk.CTk):
         # para todos menos esta app (whitelisted). Al apagar se pasan las
         # interfaces conocidas para que disable() las saque de la lista
         # aunque _prev_blacklist sea None o ya las contenga.
+        #
+        # FIX v0.1.3 (2026-11-10): cambiar de perfil funcionaba pero el
+        # boton no, porque el boton SOLO tocaba la blacklist: no
+        # reconstruia el mando virtual y no reconectaba el fisico, y
+        # HidHide solo aplica el cambio cuando el mando se reconecta.
+        # Ahora el boton hace lo mismo que un cambio de perfil: si el
+        # servicio esta corriendo, se reinicia (stop -> start), lo que
+        # recrea el virtual, re-aplica el cloak segun el switch y
+        # re-abre el fisico, asi Steam re-enumera y ve el cambio.
+        # Si no hay emulacion (Solo Triggers) y se enciende el cloak,
+        # Steam quedaria sin ningun mando (fisico oculto, sin virtual),
+        # asi que se cambia la emulacion a PS4 y se avisa.
         _on = bool(self.hidhide_switch.get())
-        if _on:
+        if _on and self.emu_selector.get() == "Solo Triggers (Sin Emular)":
+            self.emu_selector.set("DualShock 4 (PS4)")
+            self.show_alert("Anti Doble-Input",
+                            "Sin emulación no hay mando virtual: si oculto el físico, "
+                            "Steam no vería ningún mando.\n\n"
+                            "Cambié la emulación a DualShock 4 (PS4) para que Steam "
+                            "vea el virtual.")
+        elif not _on:
+            # FIX v0.1.4: apagar el boton dejaba el virtual vivo (el
+            # restart recreaba el PS4 porque el selector seguia en PS4)
+            # y Steam veia fisico + virtual = doble input otra vez.
+            # Apagar = volver al fisico solo, como en los perfiles sin
+            # emular: se pasa a Solo Triggers antes del restart.
+            self.emu_selector.set("Solo Triggers (Sin Emular)")
+        if self.running_thread:
+            # stop_service limpia el cloak y cierra el fisico/virtual;
+            # start_service recrea el virtual y re-aplica el cloak si
+            # el switch esta encendido.
+            self.stop_service()
+            self.start_service()
+        elif _on:
             if self.hw.connected:
                 self._enable_cloak()
             # Sin mando conectado, la posicion queda guardada y se aplica
@@ -4459,9 +4491,16 @@ class DualSenseStudioApp(ctk.CTk):
                             if _vcom is None:
                                 from vgamepad.win import vigem_commons as _vcom
                                 self._vcom = _vcom
-                            # c_byte es CON SIGNO: convertir bytes crudos
-                            # (0-255) o ctypes rechaza todo valor >= 128.
-                            _sb = lambda v: v - 256 if v >= 128 else v
+                            # vgamepad 0.1.0: c_byte ES c_ubyte (SIN signo,
+                            # verificado en el fuente del tag v0.1.0).
+                            # El _sb viejo restaba 256 y mandaba valores
+                            # negativos a campos unsigned: ctypes lo
+                            # rechazaba, el bloque entero fallaba en
+                            # silencio y el reporte extendido NUNCA se
+                            # enviaba (por eso la bateria nunca llegaba
+                            # a Steam y quedaba en 5%, y el touchpad
+                            # tampoco pasaba). Bytes crudos 0-255.
+                            _sb = lambda v: v & 0xFF
                             _ex = _vcom.DS4_REPORT_EX()
                             _r = _ex.Report
                             _r.bThumbLX = pad.report.bThumbLX
@@ -4550,8 +4589,15 @@ class DualSenseStudioApp(ctk.CTk):
                             _sent_ex = True
                         except ImportError:
                             self._vcom = False
-                        except Exception:
-                            pass
+                        except Exception as _ex_err:
+                            # Ya no tragarse el fallo en silencio: la primera
+                            # vez queda en debug_hid.log para cazarlo.
+                            if not getattr(self, "_ex_fail_logged", False):
+                                self._ex_fail_logged = True
+                                try:
+                                    HidHideController._cloak_debug(f"EX FAIL: {_ex_err!r}")
+                                except Exception:
+                                    pass
                     if not _sent_ex:
                         pad.update()
                     # Log de diagnóstico (post-hoc, no toca el input): al
