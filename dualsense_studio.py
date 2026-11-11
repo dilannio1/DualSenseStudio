@@ -68,7 +68,7 @@ BUILD_TAG = "ota-v3"
 # se compara con OTA_VERSION. REGLA: cada cambio sube OTA_VERSION sin
 # excepción — si el exe lleva una versión menor que el tag, la OTA lo
 # ofrece en bucle; si lleva una mayor, nunca lo ofrece.
-OTA_VERSION = "0.1.1"
+OTA_VERSION = "0.1.2"
 OTA_REPO = "dilannio1/DualSenseStudio"
 OTA_ASSET_NAME = "DualSenseStudio.exe"
 OTA_RELEASES_URL = "https://api.github.com/repos/dilannio1/DualSenseStudio/releases/latest"
@@ -720,7 +720,14 @@ class HidHideController:
         # y al restaurar para que no quede para siempre.
         prev_bl = [p for p in prev_bl if p.strip().upper() != 'HID']
         if self._prev_blacklist is None:
-            self._prev_blacklist = prev_bl
+            # Guardar como "previo" la lista SIN nuestro mando: si el
+            # mando ya estaba en la blacklist (sesion anterior, crash,
+            # HidHide Client), guardar la lista tal cual convertia ese
+            # estado oculto en el punto de restauracion, y disable()
+            # despues lo dejaba oculto para siempre.
+            self._prev_blacklist = [p for p in prev_bl
+                                    if not any(p.lower() == i.lower()
+                                               for i in instance_ids)]
         missing = [i for i in instance_ids
                    if not any(p.lower() == i.lower() for p in prev_bl)]
         if missing:
@@ -734,17 +741,65 @@ class HidHideController:
         self._cloak_debug("enable OK")
         return True, "cloak activo: los juegos no ven el DualSense físico"
 
-    def disable(self):
-        """Restaura la blacklist y el estado Active previos del usuario."""
+    def disable(self, instance_ids=None):
+        """Quita el cloak: el mando vuelve a ser visible para todos.
+
+        Antes solo restauraba la blacklist guardada en memoria
+        (_prev_blacklist). Eso fallaba en dos casos reales y dejaba el
+        mando oculto para siempre (solo lo veia esta app, por estar
+        whitelisted):
+        1) _prev_blacklist era None (cloak ya activo al arrancar la app,
+           por crash / sesion anterior / HidHide Client): disable() no
+           tocaba nada.
+        2) _prev_blacklist ya contenia el mando: restaurar eso era
+           restaurar el estado oculto.
+        Ahora SIEMPRE se lee la blacklist actual y se sacan de ella
+        nuestras interfaces (y cualquier entrada Sony VID_054C), se
+        conservan las demas entradas del usuario, y se verifica con
+        relectura. Active se apaga solo si lo apagamos nosotros o si
+        la lista queda vacia."""
+        if isinstance(instance_ids, str):
+            instance_ids = [instance_ids]
+        removal = {i.lower() for i in (instance_ids or [])}
         prev = self._prev_blacklist
         self._prev_blacklist = None
-        self._cloak_debug(f"disable restaura={prev}")
-        if prev is not None:
-            prev = [p for p in prev if p.strip().upper() != 'HID']
-            self.set_blacklist(prev)
-        if self._prev_active is not None and not self._prev_active:
-            self.set_active(False)
+        prev_active = self._prev_active
         self._prev_active = None
+        ok_cur, cur_bl = self._get_blacklist_detailed()
+        if not ok_cur:
+            # Sin lectura no se puede limpiar con seguridad; al menos
+            # intentar restaurar lo guardado, como antes.
+            if prev is not None:
+                self.set_blacklist([p for p in prev
+                                    if p.lower() not in removal
+                                    and p.strip().upper() != 'HID'])
+            if prev_active is not None and not prev_active:
+                self.set_active(False)
+            self._cloak_debug("disable SIN LECTURA: restauracion parcial")
+            return
+        cur_bl = [p for p in cur_bl if p.strip().upper() != 'HID']
+        new_bl = []
+        for p in cur_bl:
+            if p.lower() in removal:
+                continue
+            if 'VID_054C' in p.upper():
+                continue  # entrada Sony: nuestro mando (o un DualSense)
+            new_bl.append(p)
+        if prev:
+            for p in prev:
+                if (p.strip().upper() == 'HID' or p.lower() in removal
+                        or 'VID_054C' in p.upper()):
+                    continue
+                if not any(p.lower() == q.lower() for q in new_bl):
+                    new_bl.append(p)
+        self.set_blacklist(new_bl)
+        if prev_active is not None and not prev_active:
+            self.set_active(False)
+        elif prev_active is None and not new_bl:
+            # La lista quedo vacia y Active solo escondia nuestro mando.
+            self.set_active(False)
+        ok2, cur2 = self._get_blacklist_detailed()
+        self._cloak_debug(f"disable restaura={prev} nueva={new_bl} relectura={cur2 if ok2 else 'FALLO'}")
 
 
 class DualSenseHardware:
@@ -1003,9 +1058,11 @@ class DualSenseHardware:
         if len(data) > off + 52:
             batt = data[off + 52]
             st["batt_level"] = min((batt & 0x0F) * 10 + 5, 100)
+            st["batt_nibble"] = batt & 0x0F  # 0-10, escala DS4: se reenvia tal cual al DS4 virtual
             st["batt_charging"] = ((batt & 0xF0) >> 4) == 0x1
         else:
             st["batt_level"] = None
+            st["batt_nibble"] = None
             st["batt_charging"] = False
 
         return st
@@ -1946,12 +2003,35 @@ class DualSenseStudioApp(ctk.CTk):
 
     def on_hidhide_toggle(self):
         # El switch ahora SI configura el cloak (blacklist clasica por IOCTL, con restauracion).
-        if not self.hw.connected:
-            return  # se aplicara al conectar (start_service)
-        if self.hidhide_switch.get():
-            self._enable_cloak()
+        # Apagarlo TAMBIEN debe funcionar sin el mando conectado: antes el
+        # return temprano dejaba la blacklist puesta y el mando oculto
+        # para todos menos esta app (whitelisted). Al apagar se pasan las
+        # interfaces conocidas para que disable() las saque de la lista
+        # aunque _prev_blacklist sea None o ya las contenga.
+        _on = bool(self.hidhide_switch.get())
+        if _on:
+            if self.hw.connected:
+                self._enable_cloak()
+            # Sin mando conectado, la posicion queda guardada y se aplica
+            # al conectar (start_service lee el switch).
         else:
-            self.hidcloak.disable()
+            ids = None
+            if self.hw.hid_path:
+                ids = HidHideController.pad_instance_ids(self.hw.hid_path)
+            self.hidcloak.disable(ids)
+        # Persistencia del boton, segun el tipo de perfil:
+        # - Creado por el usuario: el toggle SI modifica su configuracion
+        #   de cloak y se guarda en el acto (sin necesitar el boton
+        #   Guardar). Al volver a ese perfil, _apply_profile_posture lee
+        #   ese hidhide_active guardado.
+        # - Predeterminado: NO se guarda nada en el perfil. El boton
+        #   funciona en el momento, y al cambiar de perfil la postura
+        #   del perfil que se carga lo restablece (PS4 + cloak ON en
+        #   los predeterminados, salvo Anti-cheat).
+        _name = self.current_profile_name
+        if _name and _name not in DEFAULT_PROFILES and _name in self.profiles:
+            self.profiles[_name]["hidhide_active"] = _on
+            self.save_profiles_to_disk()
         self._maybe_autosave_profile()
 
     def _enable_cloak(self):
@@ -4392,6 +4472,17 @@ class DualSenseStudioApp(ctk.CTk):
                             _r.bSpecial = pad.report.bSpecial
                             _r.bTriggerL = pad.report.bTriggerL
                             _r.bTriggerR = pad.report.bTriggerR
+                            # BATERIA: el DS4 virtual nunca recibia el nivel.
+                            # DS4_REPORT_EX tiene bBatteryLvl (0-10, misma
+                            # escala que el nibble del DualSense). Antes el
+                            # reporte extendido se creaba en 0, y Steam lo
+                            # leia siempre como ~5% aunque el mando estuviera
+                            # al 85% o al 100%. Aqui se reenvia el nibble real.
+                            _bn = st.get("batt_nibble")
+                            if _bn is not None:
+                                _r.bBatteryLvl = max(0, min(10, int(_bn)))
+                                if st.get("batt_charging"):
+                                    _r.bBatteryLvl |= 0x10
                             _touching = bool(st["touch_active"]) and not self.touch_switch.get()
                             _was = getattr(self, "_ex_touch_prev_active", False)
                             if _touching and not _was:
