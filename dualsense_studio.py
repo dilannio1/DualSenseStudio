@@ -51,6 +51,7 @@ Opcional: HidHide (anti doble-input), configurado en su propia app.
 
 import os
 import sys
+import gc
 import json
 import time
 import zlib
@@ -68,7 +69,7 @@ BUILD_TAG = "ota-v3"
 # se compara con OTA_VERSION. REGLA: cada cambio sube OTA_VERSION sin
 # excepción — si el exe lleva una versión menor que el tag, la OTA lo
 # ofrece en bucle; si lleva una mayor, nunca lo ofrece.
-OTA_VERSION = "0.1.4"
+OTA_VERSION = "0.1.11"
 OTA_REPO = "dilannio1/DualSenseStudio"
 OTA_ASSET_NAME = "DualSenseStudio.exe"
 OTA_RELEASES_URL = "https://api.github.com/repos/dilannio1/DualSenseStudio/releases/latest"
@@ -689,6 +690,16 @@ class HidHideController:
             return True, "agregado y verificado en la whitelist"
         return False, "la escritura no quedó reflejada en la whitelist"
 
+    @staticmethod
+    def _is_sony_entry(entry):
+        """True si la entrada de la blacklist es un Sony DualSense.
+        USB: HID\\VID_054C&PID_0CE6... — BT: HID\\{guid}_VID&0002054C_PID&0CE6...
+        FIX v0.1.11: el filtro viejo solo reconocia el formato USB
+        ('VID_054C') y dejaba la entrada Bluetooth en la lista para
+        siempre, asi que el fisico nunca volvia a aparecer."""
+        u = entry.upper()
+        return 'VID_054C' in u or 'VID&0002054C' in u
+
     def enable(self, instance_ids):
         """Activa el cloak para el control. Retorna (ok, mensaje).
         instance_ids: lista de TODAS las interfaces HID del mando.
@@ -705,7 +716,14 @@ class HidHideController:
         active = self.get_active()
         if active is None:
             return False, f"sin acceso al driver ({self._open_error_text()})"
-        self._prev_active = active
+        # FIX v0.1.11: guardar el Active previo SOLO la primera vez.
+        # Antes se sobrescribia en cada enable(): al cambiar entre
+        # perfiles con cloak, el segundo enable() ya registraba True
+        # (Active ya estaba prendido) y disable() despues no apagaba
+        # Active nunca. disable() lo pone en None, asi que el proximo
+        # enable() vuelve a registrar fresco.
+        if self._prev_active is None:
+            self._prev_active = active
         if not active and not self.set_active(True):
             return False, f"no se pudo activar el cloak ({self._open_error_text()})"
         if isinstance(instance_ids, str):
@@ -754,8 +772,8 @@ class HidHideController:
         2) _prev_blacklist ya contenia el mando: restaurar eso era
            restaurar el estado oculto.
         Ahora SIEMPRE se lee la blacklist actual y se sacan de ella
-        nuestras interfaces (y cualquier entrada Sony VID_054C), se
-        conservan las demas entradas del usuario, y se verifica con
+        nuestras interfaces (y cualquier entrada Sony, USB o Bluetooth),
+        se conservan las demas entradas del usuario, y se verifica con
         relectura. Active se apaga solo si lo apagamos nosotros o si
         la lista queda vacia."""
         if isinstance(instance_ids, str):
@@ -782,13 +800,13 @@ class HidHideController:
         for p in cur_bl:
             if p.lower() in removal:
                 continue
-            if 'VID_054C' in p.upper():
+            if self._is_sony_entry(p):
                 continue  # entrada Sony: nuestro mando (o un DualSense)
             new_bl.append(p)
         if prev:
             for p in prev:
                 if (p.strip().upper() == 'HID' or p.lower() in removal
-                        or 'VID_054C' in p.upper()):
+                        or self._is_sony_entry(p)):
                     continue
                 if not any(p.lower() == q.lower() for q in new_bl):
                     new_bl.append(p)
@@ -4091,9 +4109,37 @@ class DualSenseStudioApp(ctk.CTk):
         if self.running_thread:
             self.setup_virtual_controller(new_mode)
 
+    def _destroy_virtual_pad(self):
+        # FIX v0.1.10 (2026-11-11) — EL VIRTUAL NO MORIA: vgamepad solo
+        # quita el mando virtual de ViGEm en __del__ (vigem_target_remove
+        # + free), y la app solo hacia `self.virtual_pad = None`. Pero el
+        # pad guarda el callback de rumble (register_notification con
+        # _on_rumble, metodo de ESTA app) y el hilo worker guarda el pad
+        # en su variable local `pad` durante cada frame. Asi que al
+        # apagar el boton el virtual se quedaba vivo en Steam (por eso
+        # solo se veia el virtual) y Steam nunca re-escaneaba, asi que
+        # el fisico tampoco volvia aunque la blacklist de HidHide ya
+        # estaba limpia. En 0.1.4 funciono porque el recolector paso a
+        # tiempo; es no-determinista, por eso unas veces si y otras no.
+        # Ahora: se desregistra el callback, se suelta la referencia y
+        # se fuerza gc.collect() para que __del__ corra en el acto.
+        _pad = self.virtual_pad
+        self.virtual_pad = None
+        if _pad is None:
+            return
+        try:
+            _pad.unregister_notification()
+        except Exception:
+            pass
+        try:
+            del _pad
+            gc.collect()
+        except Exception:
+            pass
+
     def setup_virtual_controller(self, mode_str):
         # FIX 4: sin ViGEmBus no crashea; avisa y cae a Solo Triggers
-        self.virtual_pad = None
+        self._destroy_virtual_pad()
         self.rumble_large = 0
         self.rumble_small = 0
         try:
@@ -4155,7 +4201,9 @@ class DualSenseStudioApp(ctk.CTk):
                 self._enable_cloak()
             self.apply_triggers_to_hardware()
 
-            threading.Thread(target=self.worker_loop, daemon=True).start()
+            _wt = threading.Thread(target=self.worker_loop, daemon=True)
+            self._worker_thread = _wt
+            _wt.start()
 
             conn_mode = "Bluetooth (CRC32)" if self.hw.is_bluetooth else "USB Directo"
             self.status_label.configure(text=f"● Conectado: {conn_mode}", text_color="#4ade80")
@@ -4165,9 +4213,20 @@ class DualSenseStudioApp(ctk.CTk):
 
     def stop_service(self):
         self.running_thread = False
+        # FIX v0.1.10: esperar a que el hilo worker muera de verdad
+        # (con timeout, nunca bloquear la UI). El worker guarda el pad
+        # virtual en su variable local `pad` durante cada frame: si el
+        # restart arranca antes de que ese hilo suelte el pad, el
+        # virtual viejo sigue vivo en Steam aunque virtual_pad sea None.
+        try:
+            _wt = getattr(self, "_worker_thread", None)
+            if _wt is not None and _wt.is_alive() and threading.current_thread() is not _wt:
+                _wt.join(timeout=1.0)
+        except Exception:
+            pass
         self.hidcloak.disable()  # limpia el cloak y restaura tu config previa
         self.hw.close()
-        self.virtual_pad = None
+        self._destroy_virtual_pad()
         self.rumble_large = 0
         self.rumble_small = 0
         self._last_sig = None
@@ -4511,17 +4570,21 @@ class DualSenseStudioApp(ctk.CTk):
                             _r.bSpecial = pad.report.bSpecial
                             _r.bTriggerL = pad.report.bTriggerL
                             _r.bTriggerR = pad.report.bTriggerR
-                            # BATERIA: el DS4 virtual nunca recibia el nivel.
-                            # DS4_REPORT_EX tiene bBatteryLvl (0-10, misma
-                            # escala que el nibble del DualSense). Antes el
-                            # reporte extendido se creaba en 0, y Steam lo
-                            # leia siempre como ~5% aunque el mando estuviera
-                            # al 85% o al 100%. Aqui se reenvia el nibble real.
+                            # BATERIA (FIX v0.1.8, 2026-11-10): Steam/SDL NO
+                            # lee la bateria de bBatteryLvl (byte 12), sino
+                            # de bBatteryLvlSpecial (byte 30, nibble 0-10,
+                            # bit 0x10 = cargando). Por eso Steam mostraba
+                            # siempre 5% (= 0*10+5): ese byte quedaba en 0.
+                            # DS4Windows solo escribe bBatteryLvlSpecial.
+                            # Se escribe el nibble en AMBOS campos.
                             _bn = st.get("batt_nibble")
                             if _bn is not None:
-                                _r.bBatteryLvl = max(0, min(10, int(_bn)))
+                                _bn = max(0, min(10, int(_bn)))
+                                _r.bBatteryLvl = _bn
+                                _r.bBatteryLvlSpecial = _bn
                                 if st.get("batt_charging"):
                                     _r.bBatteryLvl |= 0x10
+                                    _r.bBatteryLvlSpecial |= 0x10
                             _touching = bool(st["touch_active"]) and not self.touch_switch.get()
                             _was = getattr(self, "_ex_touch_prev_active", False)
                             if _touching and not _was:
@@ -4551,26 +4614,34 @@ class DualSenseStudioApp(ctk.CTk):
                             else:
                                 _tx = getattr(self, "_ex_last_x", 0)
                                 _ty = getattr(self, "_ex_last_y", 0)
-                            # N=1 SIEMPRE: el hardware manda el estado up en
-                            # cada reporte (ultimo ID, ultimas coords) hasta
-                            # el proximo contacto. Un solo paquete up + N=0
-                            # se lo puede perder el juego y fusiona el gesto
-                            # siguiente con el anterior. Contador +1 por
-                            # reporte emitido (mod 256); nunca se copia el
-                            # contador del DualSense (byte 41, va al final).
+                            # FIX v0.1.8 (2026-11-10): el contador de paquetes
+                            # del touch AVANZA EN CADA FRAME, tocando o no,
+                            # como el contador del hardware que DS4Windows
+                            # reenvia tal cual. Congelarlo en reposo (0.1.7)
+                            # era la unica diferencia que quedaba con la
+                            # referencia, y Steam ignoraba los paquetes con
+                            # el contador repetido, asi que nunca veia el
+                            # flag up y el punto se quedaba pegado.
                             _tid = getattr(self, "_ex_touch_id", 0) & 0x7F
-                            self._ex_touch_counter = (getattr(self, "_ex_touch_counter", 0) + 1) & 0xFF
                             _cur = _r.sCurrentTouch
+                            self._ex_touch_counter = (getattr(self, "_ex_touch_counter", 0) + 1) & 0xFF
                             _cur.bPacketCounter = _sb(self._ex_touch_counter)
-                            _cur.bIsUpTrackingNum1 = _sb(_tid | (0x00 if _touching else 0x80))
-                            _cur.bTouchData1[0] = _sb(_tx & 0xFF)
-                            _cur.bTouchData1[1] = _sb(((_tx >> 8) & 0x0F) | ((_ty & 0x0F) << 4))
-                            _cur.bTouchData1[2] = _sb((_ty >> 4) & 0xFF)
+                            if _touching:
+                                _cur.bIsUpTrackingNum1 = _sb(_tid)
+                                _cur.bTouchData1[0] = _sb(_tx & 0xFF)
+                                _cur.bTouchData1[1] = _sb(((_tx >> 8) & 0x0F) | ((_ty & 0x0F) << 4))
+                                _cur.bTouchData1[2] = _sb((_ty >> 4) & 0xFF)
+                                _r.bTouchPacketsN = 1
+                            else:
+                                _cur.bIsUpTrackingNum1 = _sb(_tid | 0x80)
+                                _cur.bTouchData1[0] = _sb(_tx & 0xFF)
+                                _cur.bTouchData1[1] = _sb(((_tx >> 8) & 0x0F) | ((_ty & 0x0F) << 4))
+                                _cur.bTouchData1[2] = _sb((_ty >> 4) & 0xFF)
+                                _r.bTouchPacketsN = 1
                             _cur.bIsUpTrackingNum2 = _sb(0x80)
                             _cur.bTouchData2[0] = 0
                             _cur.bTouchData2[1] = 0
                             _cur.bTouchData2[2] = 0
-                            _r.bTouchPacketsN = 1
                             # Previous: patron "sin uso" siempre (con N=1 no
                             # hay historia real; ceros serian un toque DOWN
                             # en (0,0) con ID 0).
@@ -4585,6 +4656,54 @@ class DualSenseStudioApp(ctk.CTk):
                                 _p.bTouchData2[1] = 0
                                 _p.bTouchData2[2] = 0
                             self._ex_touch_prev_active = _touching
+                            # FIX v0.1.9 (2026-11-10) — RAIZ DE TODO: vgamepad
+                            # 0.1.0 define DS4_REPORT_EX con alineacion por
+                            # defecto (72 bytes, DS4_TOUCH de 12 bytes), pero
+                            # ViGEm (pshpack1.h en Common.h) lo define
+                            # EMPAQUETADO (63 bytes, DS4_TOUCH de 9). El
+                            # cliente ViGEm copia 63 bytes del buffer y el
+                            # driver los lee como empaquetado, asi que todos
+                            # los campos desde el timestamp quedaban corridos
+                            # un byte o mas. Eso explica TODO lo visto: la
+                            # bateria siempre 5% (el byte 30 leia un 0), el
+                            # punto siempre a la izquierda (la X leia el
+                            # contador), el punto nunca se borraba al soltar
+                            # (el flag up caia en otro byte) y el 0.1.8 se
+                            # movia solo (el contador avanzando movia la X
+                            # fantasma). Por eso se escribe ahora el buffer
+                            # de 63 bytes directamente, en offsets
+                            # empaquetados, copiando los campos ya calculados
+                            # arriba. (& 0xFF porque los c_byte del struct
+                            # se leen con signo.)
+                            _pk = bytearray(63)
+                            _pk[0] = _r.bThumbLX & 0xFF
+                            _pk[1] = _r.bThumbLY & 0xFF
+                            _pk[2] = _r.bThumbRX & 0xFF
+                            _pk[3] = _r.bThumbRY & 0xFF
+                            _pk[4] = _r.wButtons & 0xFF
+                            _pk[5] = (_r.wButtons >> 8) & 0xFF
+                            _pk[6] = _r.bSpecial & 0xFF
+                            _pk[7] = _r.bTriggerL & 0xFF
+                            _pk[8] = _r.bTriggerR & 0xFF
+                            # 9-10 timestamp: 0 (no se reenvia)
+                            _pk[11] = _r.bBatteryLvl & 0xFF
+                            # 12-23 gyro/accel: 0 (no se reenvian)
+                            # 24-28 unknown1: 0
+                            _pk[29] = _r.bBatteryLvlSpecial & 0xFF
+                            # 30-31 unknown2: 0
+                            _pk[32] = _r.bTouchPacketsN & 0xFF
+                            _pk[33] = _cur.bPacketCounter & 0xFF
+                            _pk[34] = _cur.bIsUpTrackingNum1 & 0xFF
+                            _pk[35] = _cur.bTouchData1[0] & 0xFF
+                            _pk[36] = _cur.bTouchData1[1] & 0xFF
+                            _pk[37] = _cur.bTouchData1[2] & 0xFF
+                            _pk[38] = _cur.bIsUpTrackingNum2 & 0xFF
+                            _pk[39] = _cur.bTouchData2[0] & 0xFF
+                            _pk[40] = _cur.bTouchData2[1] & 0xFF
+                            _pk[41] = _cur.bTouchData2[2] & 0xFF
+                            # 42-59 previous touches: ceros (DS4Windows)
+                            # 60-62: 0
+                            _ex.ReportBuffer[:] = bytes(_pk)
                             pad.update_extended_report(_ex)
                             _sent_ex = True
                         except ImportError:
