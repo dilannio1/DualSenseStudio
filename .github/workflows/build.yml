@@ -65,10 +65,29 @@ jobs:
           }
           Write-Host "Versión OK: $ver = tag $tag"
 
+      # FIX 2026-11-10: vgamepad 0.1.0 NO tiene wheel en PyPI, solo sdist,
+      # y su setup.py, en un Windows SIN ViGEmBus, lanza el instalador
+      # MSI con GUI (msiexec /i, interactivo). En el runner de GitHub,
+      # sin nadie que haga clic, eso se queda colgado para siempre en
+      # "Instalar dependencias fijas" (dos corridas atoradas ahi, 2026-11-10).
+      # En la PC de Pedro no pasa porque ViGEmBus ya esta instalado y el
+      # setup.py lo detecta por registro y se salta el MSI. Solucion: se
+      # instala ViGEmBus ANTES, en silencio (/qn), con el MSI que viene
+      # dentro del propio sdist de vgamepad, y luego pip ya no lanza nada.
+      - name: Instalar ViGEmBus en silencio (antes de pip)
+        shell: pwsh
+        run: |
+          pip download vgamepad==0.1.0 --no-deps --no-binary :all: -d vigsdist
+          tar -xzf vigsdist/vgamepad-0.1.0.tar.gz -C vigsdist
+          $msi = "vigsdist/vgamepad-0.1.0/vgamepad/win/vigem/install/x64/ViGEmBusSetup_x64.msi"
+          $p = Start-Process msiexec.exe -ArgumentList "/i", $msi, "/qn", "/norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Write-Error "ViGEmBus no se instalo (exit $($p.ExitCode))"; exit 1 }
+          Write-Host "ViGEmBus instalado (exit $($p.ExitCode))"
+
       - name: Instalar dependencias fijas
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --no-build-isolation -r requirements.txt
 
       - name: Compilar el exe
         run: python -m PyInstaller --onefile --windowed --uac-admin --icon=valdomero.ico --name "DualSenseStudio" --collect-all customtkinter --collect-all vgamepad --hidden-import win32gui --hidden-import win32process --hidden-import win32api --hidden-import win32ui --hidden-import win32con --hidden-import pywintypes --hidden-import pythoncom --hidden-import psutil --add-data "valdomero.ico;." dualsense_studio.py
@@ -79,21 +98,3 @@ jobs:
           $exe = Get-Item dist\DualSenseStudio.exe
           if ($exe.Length -lt 1000000) { Write-Error "El exe salió demasiado chico."; exit 1 }
           Write-Host "Exe OK: $($exe.Length) bytes"
-
-      - name: Guardar el exe como artefacto
-        uses: actions/upload-artifact@v4
-        with:
-          name: DualSenseStudio-exe
-          path: dist/DualSenseStudio.exe
-          if-no-files-found: error
-
-      - name: Subir el exe al release (borrador)
-        if: steps.tag.outputs.tag != ''
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $tag = "${{ steps.tag.outputs.tag }}"
-          gh release view $tag --json tagName 2>$null
-          if ($LASTEXITCODE -ne 0) { gh release create $tag --draft --title $tag --notes "Build automático." }
-          gh release upload $tag dist\DualSenseStudio.exe --clobber
