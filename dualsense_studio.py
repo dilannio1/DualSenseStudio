@@ -8,9 +8,11 @@ FIX 2: modo 0x06 (vibracion) usa orden [fuerza, inicio, fin, frecuencia]
        segun DSAdvance (r57zone). Gemini lo tenia como [freq, ...].
 FIX 3 (v2): HidHide por IOCTL real, verificado en el codigo fuente de
        nefarius/HidHide (Shared/HidHideIoctlContract.h + DEVELOPER.md).
-       El toggle ahora SI configura el cloak: session blacklist (2056/2057),
-       pensado exactamente para feeder apps como esta. Vive en memoria del
-       kernel (no toca el registro) y se limpia solo al salir del proceso.
+       El toggle ahora SI configura el cloak con la blacklist CLASICA
+       (2050/2051, persistente) + journal de propiedad. La session
+       blacklist (2056/2057) NO existe en ningun driver publicado
+       (1.5.230.0): la v0.1.16 la DETECTA y la usaria si algun dia sale
+       un driver que la traiga; mientras tanto usa la clasica.
        Requiere driver instalado y probablemente ejecutar como admin.
 FIX 4: ViGEmBus ausente ya no crashea: avisa con link de descarga y cae
        a modo "Solo Triggers".
@@ -59,22 +61,63 @@ import ctypes
 import threading
 import subprocess
 import re
+import urllib.request
 
-APP_VERSION = "v2.7"
+OTA_VERSION = "0.1.18"
+# FIX v0.1.13 (versiones inconsistentes, GPT tenia razon: habia 3
+# identificadores para la misma compilacion — APP_VERSION "v2.7",
+# OTA_VERSION "0.1.12" y BUILD_TAG "ota-v3"): las dos etiquetas que se
+# muestran en el titulo derivan de la misma version que comprueba el
+# actualizador. Solo se muestran en el titulo, no afectan a la OTA.
+# v0.1.15: 21 puntos + 5 mejoras + ZC1/ZC2 + autolimpieza de arranque
+# + journal de HidHide y lock ViGEm de GPT (ver revision-0.1.14.md).
+# La base es el borrador 0.1.15, NO el .py de GPT (ese reintroducía
+# el punto 1 y perdía la SHA obligatoria, la migración de autostart
+# y el .bat/log de la OTA). De GPT solo se trajeron las piezas nuevas
+# y seguras, verificadas una por una contra este borrador.
+# v0.1.18 (Claude): p2 marcador arranque-ok, p3 sin Authorization en
+# redirect, p4 lock HID, p5 orden SDL reporte corto, p6 aviso whitelist
+# una vez + sonda de escritura para Program Files.
+APP_VERSION = "v" + OTA_VERSION
 # Etiqueta de esta compilación (se muestra en el título): se sube en cada
 # entrega para saber qué build está corriendo.
-BUILD_TAG = "ota-v3"
+BUILD_TAG = "ota-v" + OTA_VERSION
 
 # Actualizaciones OTA (GitHub Releases). El tag del Release (v0.1.0, v0.1.1...)
 # se compara con OTA_VERSION. REGLA: cada cambio sube OTA_VERSION sin
 # excepción — si el exe lleva una versión menor que el tag, la OTA lo
 # ofrece en bucle; si lleva una mayor, nunca lo ofrece.
-OTA_VERSION = "0.1.11"
 OTA_REPO = "dilannio1/DualSenseStudio"
 OTA_ASSET_NAME = "DualSenseStudio.exe"
 OTA_RELEASES_URL = "https://api.github.com/repos/dilannio1/DualSenseStudio/releases/latest"
 OTA_IDLE_SECONDS = 5.0
 OTA_SNOOZE_SECONDS = 24 * 3600
+
+_LOG_MAX_BYTES = 1048576  # FIX v0.1.15 punto 16: ningún log crece sin límite.
+
+
+def _append_log_capped(path, text, max_bytes=_LOG_MAX_BYTES):
+    """Escribe `text` al final de `path`; si el archivo ya pasa de 1 MB,
+    conserva solo la mitad más reciente (cortando en un salto de línea)
+    antes de escribir. Todo dentro de try/except: un log nunca debe
+    tumbar la app."""
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > max_bytes:
+            with open(path, "rb") as f:
+                data = f.read()
+            keep = data[max_bytes // 2:]
+            nl = keep.find(b"\n")
+            if nl >= 0:
+                keep = keep[nl + 1:]
+            with open(path, "wb") as f:
+                f.write(keep)
+    except Exception:
+        pass
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
 
 
 def _ota_parse_version(tag):
@@ -108,23 +151,135 @@ def _ota_snooze_active(until, version, tag, now):
         return False
 
 
-def _ota_updater_script(exe_path, new_path, proc_name):
+class _StripAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """FIX v0.1.18 (Claude p3): urllib reenvia TODOS los headers al
+    seguir un redirect, incluido Authorization. El asset de GitHub
+    redirige de api.github.com al almacenamiento, que rechaza ese
+    header con 400. Al cambiar de host, el header se quita; el token
+    solo se usa contra la API (repo privado / limites)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None:
+            from urllib.parse import urlparse as _up
+            try:
+                if _up(newurl).hostname != _up(req.full_url).hostname:
+                    new_req.remove_header("Authorization")
+            except Exception:
+                pass
+        return new_req
+
+
+def _ota_updater_script(exe_path, new_path, proc_name, bak_path=None):
     """Script .bat que espera a que la app cierre, reemplaza el .exe
     (reintenta hasta 30s por si el archivo sigue bloqueado), relanza
-    la app y se borra solo."""
+    la app y se borra solo.
+
+    FIX v0.1.12 (OTA rota: la app cerraba y no pasaba nada, ni
+    reabria): el .bat viejo tenia 3 defectos — (1) la espera no tenia
+    limite: si el proceso no moria del todo, el .bat esperaba para
+    siempre y nunca llegaba al reemplazo ni al relanzado; (2) usaba
+    `timeout`, que falla sin consola (el lanzador era DETACHED_PROCESS)
+    y el bucle giraba en vacio; (3) todo silenciado, sin log, asi que
+    el fallo era invisible. Ahora: espera hasta 60s y luego taskkill y
+    sigue; los retardos usan `ping` (funciona sin consola); cada paso
+    hace echo (el lanzador guarda la salida en actualizar_log.txt).
+    Sin bloques con parentesis en los bucles: `%intentos%` se expande
+    fresco en cada vuelta.
+
+    FIX v0.1.16 (GPT plan 5): antes del reemplazo se guarda una copia
+    .bak del exe viejo (rollback real). Despues de relanzar, el .bat
+    verifica que el exe nuevo llego a correr: si aparecio en tasklist
+    y luego murio, es un exe roto -> se restaura el .bak y se relanza
+    el viejo. Si nunca aparece en 60 s, se asume que el UAC sigue
+    esperando al usuario y se deja como esta (sin rollback falso).
+    FIX v0.1.18 (Claude p2): el criterio ya no es "aparecio en tasklist
+    y luego murio" (eso confundia cerrar la app con un exe roto: si el
+    usuario cierra la app nueva en el primer minuto, el .bat restauraba
+    la vieja). Ahora el exe nuevo escribe actualizacion_arranque_ok.txt
+    ~10 s despues de arrancar sano; el .bat borra el marcador viejo
+    antes de relanzar y solo lo da por bueno si aparece el nuevo. Si el
+    proceso murio antes del marcador, rollback; si sigue vivo a los
+    120 s, se deja como esta."""
+    if bak_path is None:
+        bak_path = exe_path + ".bak"
+    # FIX v0.1.18 (Claude p2): marcador de arranque sano (ver
+    # _ota_write_boot_ok). El .bat lo borra antes de relanzar y espera
+    # a que el exe nuevo lo escriba.
+    marker_path = os.path.join(os.path.dirname(exe_path) or ".", "actualizacion_arranque_ok.txt")
     lines = [
         "@echo off",
         "REM Actualizador de DualSense Studio: reemplaza el exe y relanza.",
+        "echo [%date% %time%] Actualizador iniciado.",
         "set \"intentos=0\"",
         ":espera",
+        "set /a intentos+=1",
         f'tasklist /FI "IMAGENAME eq {proc_name}" 2>nul | find /I "{proc_name}" >nul',
-        "if not errorlevel 1 ( timeout /t 1 /nobreak >nul & goto espera )",
+        "if errorlevel 1 goto reemplazo",
+        "if %intentos% GEQ 60 goto matar",
+        "ping -n 2 127.0.0.1 >nul",
+        "goto espera",
+        ":matar",
+        "echo [%date% %time%] La app no cerro en 60s, forzando el cierre.",
+        f"taskkill /F /IM {proc_name} >nul 2>&1",
+        "ping -n 2 127.0.0.1 >nul",
         ":reemplazo",
-        f'move /Y "{new_path}" "{exe_path}" >nul 2>&1',
-        f'if exist "{new_path}" ( set /a intentos+=1 & if %intentos% GEQ 30 goto fin & timeout /t 1 /nobreak >nul & goto reemplazo )',
+        "echo [%date% %time%] Guardando copia de seguridad del exe viejo...",
+        f'copy /Y "{exe_path}" "{bak_path}" >nul',
+        "if errorlevel 1 goto finmalo",
+        "echo [%date% %time%] Reemplazando el exe...",
+        "set \"intentos=0\"",
+        ":reintentar",
+        f'move /Y "{new_path}" "{exe_path}"',
+        f'if not exist "{new_path}" goto fin',
+        "set /a intentos+=1",
+        "if %intentos% GEQ 30 goto finmalo",
+        "ping -n 2 127.0.0.1 >nul",
+        "goto reintentar",
         ":fin",
+        "echo [%date% %time%] Reemplazo OK, relanzando la app.",
+        "REM Borrar el marcador viejo: solo vale el que escriba el exe nuevo.",
+        f'del "{marker_path}" >nul 2>&1',
+        f'start "" "{exe_path}"',
+        "REM Verificacion de arranque (FIX v0.1.18, Claude p2): el exe nuevo",
+        "REM escribe actualizacion_arranque_ok.txt ~10 s despues de arrancar",
+        "REM sano. Si aparece el marcador, la actualizacion quedo bien.",
+        "REM Si el proceso aparecio y luego murio ANTES del marcador, el",
+        "REM exe esta roto -> restaurar la copia .bak y relanzar el viejo.",
+        "REM Si nunca aparece en 60 s, se asume que el UAC sigue esperando",
+        "REM al usuario y se deja como esta (sin rollback falso).",
+        "set \"intentos=0\"",
+        "set \"visto=0\"",
+        ":verificar",
+        "set /a intentos+=1",
+        f'if exist "{marker_path}" goto salirbien',
+        f'tasklist /FI "IMAGENAME eq {proc_name}" 2>nul | find /I "{proc_name}" >nul',
+        "if errorlevel 1 goto noesta",
+        "set \"visto=1\"",
+        "goto vervisto",
+        ":noesta",
+        "if %visto% EQU 1 goto restaurar",
+        "if %intentos% GEQ 60 goto salirbien",
+        "ping -n 2 127.0.0.1 >nul",
+        "goto verificar",
+        ":vervisto",
+        "if %intentos% GEQ 120 goto salirbien",
+        "ping -n 2 127.0.0.1 >nul",
+        "goto verificar",
+        ":restaurar",
+        "echo [%date% %time%] ERROR: el exe nuevo murio al arrancar, restaurando la copia de seguridad.",
+        f'move /Y "{bak_path}" "{exe_path}"',
         f'start "" "{exe_path}"',
         'del "%~f0"',
+        "goto salir",
+        ":salirbien",
+        "echo [%date% %time%] La app nueva esta corriendo. Actualizacion completa.",
+        'del "%~f0"',
+        "goto salir",
+        ":finmalo",
+        "echo [%date% %time%] ERROR: no se pudo reemplazar el exe, relanzando el viejo.",
+        f'start "" "{exe_path}"',
+        'del "%~f0"',
+        ":salir",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -194,6 +349,7 @@ PROFILES_FILE = os.path.join(BASE_DIR, "perfiles_dualsense.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "studio_settings.json")
 GAME_PROFILES_FILE = os.path.join(BASE_DIR, "juegos_perfiles.json")
 GAME_ICONS_DIR = os.path.join(BASE_DIR, "game_icons")
+OTA_BOOT_OK_FILE = os.path.join(BASE_DIR, "actualizacion_arranque_ok.txt")  # FIX v0.1.18 (Claude p2)
 
 def _find_valdomero_ico():
     """Busca valdomero.ico junto al .exe/.py o dentro del bundle PyInstaller (_MEIPASS)."""
@@ -339,6 +495,13 @@ def _ctl_code(device_type, function, method, access):
 # restauracion de la config previa del usuario al apagar el toggle/salir.
 _IOCTL_GET_BLACKLIST = _ctl_code(32769, 2050, 0, 1)
 _IOCTL_SET_BLACKLIST = _ctl_code(32769, 2051, 0, 1)
+# FIX v0.1.16 (GPT plan 1): IOCTL de SESION (2056 ADD / 2057 CLR).
+# No existen en ningun driver publicado (1.5.230.0); se usan SOLO si
+# la deteccion (_probe_session_support) confirma que el driver los
+# acepta. Las entradas de sesion mueren con el proceso: un crash no
+# deja el mando oculto para siempre.
+_IOCTL_SESSION_ADD = _ctl_code(32769, 2056, 0, 1)
+_IOCTL_SESSION_CLR = _ctl_code(32769, 2057, 0, 1)
 # Whitelist permanente (verificado en Shared/HidHideIoctlContract.h del
 # repo nefarius/HidHide): 2048 = GET, 2049 = SET. Es persistente
 # (queda en HKLM\SYSTEM\CurrentControlSet\Services\HidHide\Parameters),
@@ -374,6 +537,262 @@ class HidHideController:
     def __init__(self):
         self._prev_active = None  # para restaurar la config del usuario al salir
         self._prev_blacklist = None  # lista previa (sin tocar) para restaurar
+        # FIX v0.1.15 ZC1: instance IDs que ESTA sesión escondió. disable()
+        # solo quita estas (o las que se le pasen) + la basura 'HID':
+        # cualquier otra entrada Sony (p. ej. un segundo DualSense que el
+        self._cloak_ids = None
+        # FIX v0.1.15 (GPT v0.1.13_fixed): registro persistente de lo
+        # que ESTA app cambió en HidHide (journal). Si la app muere con
+        # el cloak puesto, el próximo arranque/disable sabe exactamente
+        # qué IDs y qué whitelist quitar, sin tocar nada ajeno.
+        self._managed_blacklist_ids = set()
+        # FIX v0.1.17 (GPT 0.1.16, adaptado): entradas en estado
+        # PENDING — se anotan en el journal ANTES del IOCTL y solo se
+        # promueven a propias tras la relectura que pruebe que
+        # quedaron. Si la app muere en la ventana ambigua, el arranque
+        # las resuelve (presente en la lista = nuestra; ausente =
+        # nunca quedó) sin dejar el mando atascado.
+        self._pending_blacklist_ids = set()
+        self._pending_whitelist_path = None
+        self._managed_whitelist_path = None
+        self._legacy_prompted = False
+        self._owned_state_path = os.path.join(BASE_DIR, "hidhide_owned_entries.json")
+        self._load_owned_state()
+        # FIX v0.1.15 (GPT high): la autolimpieza de arranque corre en
+        # segundo plano; este evento dice cuando termino (empieza puesto
+        # para que enable() no espere si la limpieza nunca se arranco).
+        self._startup_cleanup_done = threading.Event()
+        self._startup_cleanup_done.set()
+        self._startup_cleanup_started = False
+        # FIX v0.1.16 (GPT plan 1): deteccion de session blacklist
+        # (None = sin probar aun), IDs vivas en modo sesion y IDs que
+        # ya estaban ocultas ANTES de que esta app tocara nada (esas
+        # NUNCA se quitan: son del usuario, no nuestras).
+        self._session_supported = None
+        self._session_ids = set()
+        self._preexisting_ids = None
+        self._startup_unknown_sony = []
+
+    def _load_owned_state(self):
+        """Recupera propiedad exacta de cambios propios tras un crash."""
+        try:
+            with open(self._owned_state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("schema") == 1:
+                self._managed_blacklist_ids = {
+                    str(x).lower() for x in data.get("blacklist_ids", [])
+                    if isinstance(x, str) and x.strip()
+                    and ("vid_054c" in str(x).lower() or "vid&0002054c" in str(x).lower())
+                }
+                wp = data.get("whitelist_path")
+                expected = self._dos_device_path(sys.executable) if getattr(sys, "frozen", False) else None
+                self._managed_whitelist_path = (
+                    wp if isinstance(wp, str) and expected and wp.lower() == expected.lower() else None
+                )
+                self._pending_blacklist_ids = {
+                    str(x).lower() for x in data.get("pending_blacklist_ids", [])
+                    if isinstance(x, str) and x.strip()
+                    and ("vid_054c" in str(x).lower() or "vid&0002054c" in str(x).lower())
+                }
+                rap = data.get("restore_active_to")
+                self._prev_active = rap if isinstance(rap, bool) else None
+                _pwp = data.get("pending_whitelist_path")
+                self._pending_whitelist_path = (
+                    _pwp if isinstance(_pwp, str) and expected and _pwp.lower() == expected.lower() else None
+                )
+                lp = data.get("legacy_prompted")
+                self._legacy_prompted = lp if isinstance(lp, bool) else False
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            self._cloak_debug(f"ownership state ilegible; no se borrará nada automáticamente: {exc!r}")
+
+    def _save_owned_state(self):
+        """Escritura atómica del registro de propiedad de HidHide."""
+        data = {
+            "schema": 1,
+            "blacklist_ids": sorted(self._managed_blacklist_ids),
+            "whitelist_path": self._managed_whitelist_path,
+            "pending_blacklist_ids": sorted(getattr(self, "_pending_blacklist_ids", set())),
+            "pending_whitelist_path": getattr(self, "_pending_whitelist_path", None),
+            "restore_active_to": self._prev_active,
+            "legacy_prompted": getattr(self, "_legacy_prompted", False),
+        }
+        tmp = self._owned_state_path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(self._owned_state_path), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._owned_state_path)
+            return True
+        except Exception as exc:
+            self._cloak_debug(f"no se pudo guardar ownership state: {exc!r}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+    def _clear_owned_state_file(self):
+        try:
+            if os.path.exists(self._owned_state_path):
+                os.remove(self._owned_state_path)
+        except OSError as exc:
+            self._cloak_debug(f"no se pudo borrar ownership state: {exc!r}")
+
+    def _restore_owned_whitelist(self):
+        """Retira de whitelist solo la ruta agregada por esta instancia.
+
+        Acordado con Pedro 2026-11-12: la whitelist NO queda para
+        siempre; la app solo se añade cuando activa el cloak y se quita
+        al apagarlo. Si la ruta no es nuestra, no se toca.
+        """
+        path = self._managed_whitelist_path
+        if not path:
+            return True
+        ok, current = self._get_whitelist_detailed()
+        if not ok:
+            self._cloak_debug("no se pudo leer whitelist para retirar ruta propia")
+            return False
+        updated = [p for p in current if p.lower() != path.lower()]
+        if len(updated) != len(current):
+            if not self.set_whitelist(updated):
+                self._cloak_debug("no se pudo retirar whitelist propia")
+                return False
+            ok2, verify = self._get_whitelist_detailed()
+            if not ok2 or any(p.lower() == path.lower() for p in verify):
+                self._cloak_debug("no se pudo verificar retirada de whitelist propia")
+                return False
+        self._managed_whitelist_path = None
+        return True
+
+    def begin_startup_cleanup(self):
+        """Arranca la autolimpieza de la blacklist en segundo plano.
+        FIX v0.1.15 (GPT high): si una sesion anterior dejo el DualSense
+        atorado en la blacklist permanente (crash / proceso terminado /
+        PC apagado con el cloak puesto), el proximo arranque lo saca.
+        No asume que la limpieza de salida vaya a correr nunca."""
+        if getattr(self, "_startup_cleanup_started", False):
+            return
+        self._startup_cleanup_started = True
+        self._startup_cleanup_done.clear()
+        try:
+            threading.Thread(target=self._startup_cleanup_thread, daemon=True).start()
+        except Exception:
+            try:
+                self._startup_cleanup_done.set()
+            except Exception:
+                pass
+
+    def _startup_cleanup_thread(self):
+        """Lee la blacklist actual y saca SOLO las entradas que esta
+        app escondio (journal) + la basura 'HID'. Las Sony ajenas no se
+        tocan: quedan en _startup_unknown_sony para el prompt unico.
+        Corre una sola vez por arranque, en hilo daemon. Si la lista
+        queda vacia y Active estaba prendido, lo apaga (con la lista
+        vacia Active no esconde nada). Todo queda en debug_hid.log."""
+        try:
+            svc_ok, svc_msg = self.ensure_service_running()
+            if not svc_ok:
+                self._cloak_debug(f"STARTUP-CLEANUP: sin servicio ({svc_msg})")
+                return
+            ok, cur_bl = self._get_blacklist_detailed()
+            if not ok:
+                self._cloak_debug("STARTUP-CLEANUP: no se pudo leer la blacklist")
+                return
+            # FIX v0.1.16 (GPT plan 1): la limpieza SOLO quita lo que
+            # ESTA app escondio (journal) + la basura 'HID' (nunca es
+            # una entrada real). Las Sony ajenas (escondidas a mano o
+            # por otro programa) NO se tocan: quedan registradas en
+            # _startup_unknown_sony para el prompt unico de la app.
+            _owned = {m.lower() for m in self._managed_blacklist_ids}
+            # FIX v0.1.17 (GPT pending, adaptado): resolver las
+            # entradas PENDING del journal ANTES de decidir qué es
+            # atascado. Presente en la lista = la escritura sí quedó:
+            # se promueve a propia y se limpia como atascada (la
+            # limpieza automática de arranque se mantiene). Ausente =
+            # nunca quedó: se suelta del journal sin tocar nada.
+            _pending = {m.lower() for m in getattr(self, "_pending_blacklist_ids", set())}
+            if _pending:
+                _promoted = {p for p in _pending
+                             if any(p == q.lower() for q in cur_bl)}
+                if _promoted:
+                    self._managed_blacklist_ids.update(_promoted)
+                    self._cloak_debug(f"STARTUP-CLEANUP: pending promovidas a propias: {sorted(_promoted)}")
+                self._pending_blacklist_ids.difference_update(_pending)
+                self._save_owned_state()
+                _owned = {m.lower() for m in self._managed_blacklist_ids}
+            _pwp = getattr(self, "_pending_whitelist_path", None)
+            if _pwp:
+                _ok_wl, _cur_wl = self._get_whitelist_detailed()
+                if _ok_wl and any(p.lower() == _pwp.lower() for p in _cur_wl):
+                    self._managed_whitelist_path = _pwp
+                    self._cloak_debug("STARTUP-CLEANUP: pending whitelist promovida a propia")
+                self._pending_whitelist_path = None
+                self._save_owned_state()
+            stale = [p for p in cur_bl
+                     if p.strip().upper() == 'HID' or p.lower() in _owned]
+            self._startup_unknown_sony = [
+                p for p in cur_bl
+                if self._is_sony_entry(p) and p.lower() not in _owned]
+            if self._startup_unknown_sony:
+                self._cloak_debug(
+                    f"STARTUP-CLEANUP: entradas Sony AJENAS (no se tocan): "
+                    f"{self._startup_unknown_sony}")
+            if not stale:
+                self._cloak_debug("STARTUP-CLEANUP: blacklist limpia, nada que sacar")
+                # FIX v0.1.15 (GPT journal): si el crash dejó la
+                # whitelist propia y ya no hay IDs nuestros en la lista,
+                # quitarla también (no queda para siempre). Las IDs del
+                # journal que ya no están en la lista se dan por limpias.
+                try:
+                    _gone = [m for m in list(self._managed_blacklist_ids)
+                             if m not in {p.lower() for p in cur_bl}]
+                    self._managed_blacklist_ids.difference_update(_gone)
+                    self._restore_owned_whitelist()
+                    self._save_owned_state()
+                    if not self._managed_blacklist_ids and not self._managed_whitelist_path and self._prev_active is None:
+                        self._clear_owned_state_file()
+                except Exception:
+                    pass
+                return
+            new_bl = [p for p in cur_bl
+                      if p.strip().upper() != 'HID' and p.lower() not in _owned]
+            if not self.set_blacklist(new_bl):
+                self._cloak_debug("STARTUP-CLEANUP: no se pudo escribir la blacklist")
+                return
+            ok2, cur2 = self._get_blacklist_detailed()
+            if ok2:
+                left = [p for p in cur2 if self._is_sony_entry(p)]
+                self._cloak_debug(f"STARTUP-CLEANUP: sacadas {len(stale)} entradas atoradas, quedan Sony={len(left)} relectura={cur2}")
+                if not cur2 and self.get_active():
+                    self.set_active(False)
+                    self._cloak_debug("STARTUP-CLEANUP: lista vacia, Active apagado")
+                # FIX v0.1.15 (GPT journal): las IDs atoradas ya salieron
+                # de la lista; depurar el journal y la whitelist propia.
+                try:
+                    self._managed_blacklist_ids.difference_update(p.lower() for p in stale)
+                    self._restore_owned_whitelist()
+                    self._save_owned_state()
+                    if not self._managed_blacklist_ids and not self._managed_whitelist_path and self._prev_active is None:
+                        self._clear_owned_state_file()
+                except Exception:
+                    pass
+            else:
+                self._cloak_debug("STARTUP-CLEANUP: escrita, relectura fallo")
+        except Exception as exc:
+            try:
+                self._cloak_debug(f"STARTUP-CLEANUP FAIL: {exc!r}")
+            except Exception:
+                pass
+        finally:
+            try:
+                self._startup_cleanup_done.set()
+            except Exception:
+                pass
 
     @classmethod
     def service_state(cls):
@@ -382,8 +801,15 @@ class HidHideController:
         de Windows (en espanol sc muestra ESTADO/DETENIDO, no RUNNING/STOPPED,
         asi que buscar esas palabras inglesas falla siempre)."""
         try:
-            r = subprocess.run("sc query HidHide", shell=True,
-                               capture_output=True, text=True, timeout=10)
+            # FIX v0.1.15 punto 20: timeout 2 s, no 10 s — un `sc query`
+            # local vuelve en milisegundos si el SCM está sano; con 10 s
+            # una consulta colgada congelaba la UI (esto corre en el hilo
+            # principal desde start_service -> enable).
+            # FIX v0.1.15 M25: lista de argumentos, sin shell=True (sin
+            # intérprete de comandos de por medio).
+            r = subprocess.run(["sc", "query", "HidHide"],
+                               capture_output=True, text=True, timeout=2,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             out = r.stdout + r.stderr
         except Exception:
             return False, None
@@ -417,8 +843,12 @@ class HidHideController:
             if state in (1, None) and not started:
                 started = True
                 try:
-                    r = subprocess.run("sc start HidHide", shell=True,
-                                       capture_output=True, text=True, timeout=10)
+                    # FIX v0.1.15 punto 20: timeout 2 s, no 10 s (la espera
+                    # a RUNNING ya la acota el bucle con deadline de 4 s).
+                    # FIX v0.1.15 M25: lista de argumentos, sin shell=True.
+                    r = subprocess.run(["sc", "start", "HidHide"],
+                                       capture_output=True, text=True, timeout=2,
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                     start_out = r.stdout + r.stderr
                 except Exception as e:
                     return False, f"no se pudo ejecutar sc start ({e})"
@@ -578,11 +1008,8 @@ class HidHideController:
     def _cloak_debug(msg):
         """Diagnostico post-hoc: escribe en debug_hid.log (mismo archivo
         que el resto de la app). Nunca en el camino de entrada."""
-        try:
-            with open(os.path.join(BASE_DIR, "debug_hid.log"), "a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%H:%M:%S')} CLOAK {msg}\n")
-        except Exception:
-            pass
+        _append_log_capped(os.path.join(BASE_DIR, "debug_hid.log"),
+                           f"{time.strftime('%H:%M:%S')} CLOAK {msg}\n")
 
     @classmethod
     def _multisz(cls, strings):
@@ -622,10 +1049,10 @@ class HidHideController:
     def _get_whitelist_detailed(cls):
         """(ok, lista). ok=False distingue 'fallo el IOCTL' de 'lista vacia'."""
         ok, out = cls._ioctl(_IOCTL_GET_WHITELIST, out_size=8192)
-        if not ok or not out:
+        if not ok:
             return False, []
         try:
-            text = out.decode('utf-16-le', errors='ignore')
+            text = out.decode('utf-16-le', errors='ignore') if out else ''
         except Exception:
             return False, []
         return True, [s for s in text.split('\x00') if s]
@@ -662,15 +1089,18 @@ class HidHideController:
         ok, _ = cls._ioctl(_IOCTL_SET_BLACKLIST, in_bytes, out_size=0)
         return ok
 
-    @classmethod
-    def ensure_self_whitelisted(cls):
+    def ensure_self_whitelisted(self):
         """Agrega el .exe propio a la whitelist permanente y VERIFICA que quedo.
         Retorna (ok, motivo).
         Solo con el .exe compilado: con el .py el ejecutable seria python.exe
         y agregarlo eximiria a TODOS los programas Python, no solo a esta app.
         ORDEN: llamarse ANTES de activar el cloak. El driver no exime al dueno
         de la sesion (Logic.c: solo la whitelist exime): sin whitelist, la app
-        no puede reabrir el mando tras activar el cloak."""
+        no puede reabrir el mando tras activar el cloak.
+        FIX v0.1.15 (GPT): registra en el journal si ESTA instancia agregó
+        la ruta, para quitarla al apagar el cloak (no queda para siempre).
+        Si ya estaba (de otra sesión o a mano), NO se registra como nuestra."""
+        cls = type(self)
         if not getattr(sys, 'frozen', False):
             return False, "no compilado (.py): el whitelist no aplica"
         dev_path = cls._dos_device_path(sys.executable)
@@ -681,12 +1111,25 @@ class HidHideController:
             return False, f"no se pudo leer la whitelist ({cls._open_error_text()})"
         if any(p.lower() == dev_path.lower() for p in current):
             return True, "ya estaba en la whitelist"
+        # FIX v0.1.17 (GPT pending): registrar la ruta como PENDING
+        # antes de escribir; solo se promueve a propia tras la
+        # verificación de relectura. Si la app muere en la ventana,
+        # el arranque la resuelve.
+        self._pending_whitelist_path = dev_path
+        if not self._save_owned_state():
+            self._pending_whitelist_path = None
+            return False, "no se pudo guardar el registro de propiedad de la whitelist"
         if not cls.set_whitelist(current + [dev_path]):
+            self._pending_whitelist_path = None
+            self._save_owned_state()
             return False, f"no se pudo escribir la whitelist ({cls._open_error_text()})"
         ok2, current2 = cls._get_whitelist_detailed()
         if not ok2:
             return False, f"se escribió pero no se pudo verificar ({cls._open_error_text()})"
         if any(p.lower() == dev_path.lower() for p in current2):
+            self._pending_whitelist_path = None
+            self._managed_whitelist_path = dev_path
+            self._save_owned_state()
             return True, "agregado y verificado en la whitelist"
         return False, "la escritura no quedó reflejada en la whitelist"
 
@@ -700,12 +1143,74 @@ class HidHideController:
         u = entry.upper()
         return 'VID_054C' in u or 'VID&0002054C' in u
 
+    # FIX v0.1.16 (GPT plan 1): deteccion de session blacklist.
+    @classmethod
+    def _probe_session_support(cls):
+        """True si el driver acepta los IOCTL de sesion (2056/2057).
+        Prueba: ADD de la entrada basura 'HID' (nunca es un dispositivo
+        real) y CLR inmediato. Si el driver es viejo, el ADD falla y no
+        cambia nada; si es nuevo, la entrada muere con el proceso igual.
+        Nunca se prueba con un ID real."""
+        try:
+            ok, _ = cls._ioctl(_IOCTL_SESSION_ADD, cls._multisz(["HID"]), out_size=0)
+            if not ok:
+                return False
+            cls._ioctl(_IOCTL_SESSION_CLR, cls._multisz(["HID"]), out_size=0)
+            return True
+        except Exception:
+            return False
+
+    def _session_supported_cached(self):
+        """Deteccion perezosa: una sola vez por sesion de la app."""
+        try:
+            if self._session_supported is None:
+                self._session_supported = type(self)._probe_session_support()
+                self._cloak_debug(f"SESSION-BLACKLIST soportada={self._session_supported}")
+        except Exception:
+            self._session_supported = False
+        return bool(self._session_supported)
+
+    @classmethod
+    def _session_add(cls, instance_ids):
+        """Agrega IDs a la blacklist de sesion, una por una (el IOCTL
+        de sesion trabaja por entrada, no por lista). Retorna
+        (ok_todas, agregadas): si una falla a mitad, las anteriores
+        quedan y el llamador las limpia."""
+        added = []
+        for i in instance_ids:
+            ok, _ = cls._ioctl(_IOCTL_SESSION_ADD, cls._multisz([i]), out_size=0)
+            if not ok:
+                return False, added
+            added.append(i)
+        return True, added
+
+    @classmethod
+    def _session_clr(cls, instance_ids):
+        """Quita IDs de la blacklist de sesion (best-effort)."""
+        ok_all = True
+        for i in instance_ids:
+            ok, _ = cls._ioctl(_IOCTL_SESSION_CLR, cls._multisz([i]), out_size=0)
+            if not ok:
+                ok_all = False
+        return ok_all
+
     def enable(self, instance_ids):
         """Activa el cloak para el control. Retorna (ok, mensaje).
         instance_ids: lista de TODAS las interfaces HID del mando.
         ORDEN OBLIGATORIO (el driver no exime al dueno de la sesion):
         1) servicio en ejecucion, 2) whitelist propio VERIFICADO,
         3) Active=1, 4) interfaces en la blacklist (guardando la previa)."""
+        # FIX v0.1.15 (GPT high): no aplicar el cloak hasta que termine
+        # la autolimpieza de arranque (max 5 s): si una sesion anterior
+        # dejo el mando atorado en la blacklist, primero se saca y
+        # despues se aplica lo que toque. Si la limpieza se atasca, el
+        # timeout deja seguir igual que antes. (Antes 10 s; el hilo de
+        # limpieza ahora también está acotado por el punto 20, así que
+        # 5 s bastan para el caso normal.)
+        try:
+            self._startup_cleanup_done.wait(timeout=5)
+        except Exception:
+            pass
         svc_ok, svc_msg = self.ensure_service_running()
         if not svc_ok:
             return False, svc_msg
@@ -724,6 +1229,11 @@ class HidHideController:
         # enable() vuelve a registrar fresco.
         if self._prev_active is None:
             self._prev_active = active
+        # FIX v0.1.15 (GPT journal): guardar a qué Active hay que volver
+        # ANTES de tocarlo: si la app muere con el cloak puesto, el
+        # journal dice que Active estaba apagado.
+        if not active:
+            self._save_owned_state()
         if not active and not self.set_active(True):
             return False, f"no se pudo activar el cloak ({self._open_error_text()})"
         if isinstance(instance_ids, str):
@@ -731,57 +1241,184 @@ class HidHideController:
         self._cloak_debug(f"enable ids={instance_ids}")
         ok_bl, prev_bl = self._get_blacklist_detailed()
         if not ok_bl:
+            # FIX v0.1.16: antes de este return _cloak_ids quedaba puesto
+            # y Active prendido: un disable() despues quitaba IDs que la
+            # app nunca escondio. Limpiar y revertir Active si lo
+            # prendimos nosotros.
+            self._cloak_ids = None
+            self._preexisting_ids = None
+            if not active:
+                try:
+                    self.set_active(False)
+                except Exception:
+                    pass
             return False, f"no se pudo leer la blacklist ({self._open_error_text()})"
         self._cloak_debug(f"prev_blacklist={prev_bl} active={active}")
         # Limpieza: v3/v4 escribieron la entrada basura 'HID' (conversion
         # rota en BT); nunca es una entrada real, se descarta al guardar
         # y al restaurar para que no quede para siempre.
         prev_bl = [p for p in prev_bl if p.strip().upper() != 'HID']
-        if self._prev_blacklist is None:
-            # Guardar como "previo" la lista SIN nuestro mando: si el
-            # mando ya estaba en la blacklist (sesion anterior, crash,
-            # HidHide Client), guardar la lista tal cual convertia ese
-            # estado oculto en el punto de restauracion, y disable()
-            # despues lo dejaba oculto para siempre.
-            self._prev_blacklist = [p for p in prev_bl
-                                    if not any(p.lower() == i.lower()
-                                               for i in instance_ids)]
         missing = [i for i in instance_ids
                    if not any(p.lower() == i.lower() for p in prev_bl)]
+        # FIX v0.1.16 (GPT plan 1): IDs que YA estaban ocultas antes de
+        # que esta app tocara nada (a mano, otro programa, crash viejo).
+        # Son del usuario: no se registran como nuestras, no entran al
+        # journal y disable() NUNCA las quita.
+        self._preexisting_ids = [i for i in instance_ids
+                                 if any(p.lower() == i.lower() for p in prev_bl)]
+        if self._prev_blacklist is None:
+            # Guardar como "previo" la lista SIN lo que vamos a agregar:
+            # las preexistentes QUEDAN en la lista previa (son de el).
+            _missing_lower = {m.lower() for m in missing}
+            self._prev_blacklist = [p for p in prev_bl
+                                    if p.lower() not in _missing_lower]
+        # FIX v0.1.15 ZC1 (v0.1.16: solo lo NUEVO): recordar qué IDs
+        # escondió ESTA sesión, para que disable() solo quite lo nuestro.
+        self._cloak_ids = list(missing)
+        # FIX v0.1.16 (GPT plan 1): si el driver trae session
+        # blacklist, usarla: las entradas mueren con el proceso y un
+        # crash no deja el mando oculto. En modo sesion NO se escribe
+        # el journal persistente (no hay nada que limpiar al arrancar:
+        # la sesion murio con el proceso).
+        if missing and self._session_supported_cached():
+            _ok_sess, _added = type(self)._session_add(missing)
+            if not _ok_sess:
+                type(self)._session_clr(_added)
+                self._cloak_ids = None
+                self._preexisting_ids = None
+                if not active:
+                    try:
+                        self.set_active(False)
+                    except Exception:
+                        pass
+                return False, f"no se pudo ocultar el mando en modo sesión ({self._open_error_text()})"
+            self._session_ids.update(i.lower() for i in missing)
+            self._cloak_debug(f"enable SESION OK ids={missing}")
+            self._save_owned_state()
+            return True, "cloak activo (sesión): los juegos no ven el DualSense físico"
+        # FIX v0.1.17 (GPT pending): registrar las IDs nuevas como
+        # PENDING antes de escribirlas. Solo se promueven a propias
+        # tras la relectura que pruebe que quedaron; si la app muere
+        # a mitad, el arranque las resuelve.
+        if missing:
+            self._pending_blacklist_ids.update(i.lower() for i in missing)
+            if not self._save_owned_state():
+                self._pending_blacklist_ids.difference_update(i.lower() for i in missing)
+                if not active:
+                    try:
+                        self.set_active(False)
+                    except Exception:
+                        pass
+                self._cloak_ids = None
+                self._preexisting_ids = None
+                return False, "no se pudo guardar el registro de propiedad de HidHide"
         if missing:
             new_bl = prev_bl + missing
             if not self.set_blacklist(new_bl):
+                # FIX v0.1.15 ZC2: si la escritura falla DESPUÉS de haber
+                # prendido Active, no dejar el medio cloak (Active
+                # prendido con la lista vieja): apagar Active solo si
+                # fuimos nosotros quienes lo prendimos (estaba apagado
+                # antes de este enable). El resultado del IOCTL puede ser
+                # ambiguo: solo se borran del journal las IDs que la
+                # relectura confirma que NO quedaron.
+                _ok_now, _now_list = self._get_blacklist_detailed()
+                _absent = _ok_now and all(not any(p.lower() == i.lower() for p in _now_list)
+                                          for i in missing)
+                if _absent:
+                    self._pending_blacklist_ids.difference_update(i.lower() for i in missing)
+                    self._save_owned_state()
+                if not active:
+                    try:
+                        self.set_active(False)
+                    except Exception:
+                        pass
+                self._cloak_ids = None
+                self._preexisting_ids = None
                 return False, f"no se pudo ocultar el mando ({self._open_error_text()})"
             ok_bl2, cur_bl = self._get_blacklist_detailed()
             self._cloak_debug(f"escrito={new_bl} relectura={cur_bl}")
             if not ok_bl2 or not all(any(p.lower() == i.lower() for p in cur_bl) for i in instance_ids):
-                return False, "la blacklist no quedó aplicada"
+                # FIX v0.1.15 ZC2: mismo medio cloak — la relectura no
+                # muestra nuestras IDs (la escritura no quedó o no se
+                # pudo leer): intentar revertir solo lo agregado y apagar
+                # Active si lo prendimos nosotros.
+                _ok_now, _now_list = self._get_blacklist_detailed()
+                _rolled_back = False
+                if _ok_now:
+                    _rollback = [p for p in _now_list
+                                 if not any(p.lower() == i.lower() for i in missing)]
+                    if self.set_blacklist(_rollback):
+                        _ok_rb, _rb_list = self._get_blacklist_detailed()
+                        _rolled_back = _ok_rb and all(
+                            not any(p.lower() == i.lower() for p in _rb_list) for i in missing
+                        )
+                if _rolled_back:
+                    self._pending_blacklist_ids.difference_update(i.lower() for i in missing)
+                    self._save_owned_state()
+                if not active:
+                    try:
+                        self.set_active(False)
+                    except Exception:
+                        pass
+                self._cloak_ids = None
+                self._preexisting_ids = None
+                return False, "la blacklist no quedó aplicada; se intentó revertir solo lo agregado"
+        # FIX v0.1.17: la relectura probó que las IDs quedaron; las
+        # PENDING se promueven a propias.
+        if missing:
+            _ml = {i.lower() for i in missing}
+            self._pending_blacklist_ids.difference_update(_ml)
+            self._managed_blacklist_ids.update(_ml)
+        self._save_owned_state()
         self._cloak_debug("enable OK")
         return True, "cloak activo: los juegos no ven el DualSense físico"
 
     def disable(self, instance_ids=None):
         """Quita el cloak: el mando vuelve a ser visible para todos.
 
-        Antes solo restauraba la blacklist guardada en memoria
-        (_prev_blacklist). Eso fallaba en dos casos reales y dejaba el
-        mando oculto para siempre (solo lo veia esta app, por estar
-        whitelisted):
-        1) _prev_blacklist era None (cloak ya activo al arrancar la app,
-           por crash / sesion anterior / HidHide Client): disable() no
-           tocaba nada.
-        2) _prev_blacklist ya contenia el mando: restaurar eso era
-           restaurar el estado oculto.
-        Ahora SIEMPRE se lee la blacklist actual y se sacan de ella
-        nuestras interfaces (y cualquier entrada Sony, USB o Bluetooth),
-        se conservan las demas entradas del usuario, y se verifica con
-        relectura. Active se apaga solo si lo apagamos nosotros o si
-        la lista queda vacia."""
+        Solo se quitan las entradas que ESTA app escondió: las de la
+        sesión actual (_cloak_ids / las que se pasan aquí) más las del
+        journal persistente (una sesión anterior que murió con el cloak
+        puesto). Cualquier otra entrada — p. ej. un segundo DualSense
+        que el usuario escondió a mano en el HidHide Client — es de él
+        y se deja quieta (FIX v0.1.15 ZC1). La whitelist propia también
+        se retira solo si esta app la agregó (journal); si la ruta ya
+        estaba, no se toca. Active se apaga solo si lo prendimos
+        nosotros. Retorna (ok, mensaje); si algo falla, el journal
+        conserva la propiedad para reintentarlo.
+        """
         if isinstance(instance_ids, str):
             instance_ids = [instance_ids]
-        removal = {i.lower() for i in (instance_ids or [])}
+        # FIX v0.1.16 (GPT plan 1): las IDs que se pasen solo cuentan
+        # si YA son propiedad de la app (journal o sesion actual). Unas
+        # IDs actuales que nunca escondimos (p. ej. el mando ya estaba
+        # oculto a mano y el toggle las pasa) NO se tocan.
+        _owned_lower = set(self._managed_blacklist_ids) | {c.lower() for c in (self._cloak_ids or [])}
+        _passed = list(instance_ids) if instance_ids else list(self._cloak_ids or [])
+        known = [i for i in _passed if i.lower() in _owned_lower]
+        managed = {i.lower() for i in known} | set(self._managed_blacklist_ids)
+        # FIX v0.1.16: en modo sesion, quitar tambien las entradas de
+        # sesion vivas (mueren con el proceso, pero hay que sacarlas al
+        # apagar el cloak en esta misma sesion).
+        try:
+            _sess_ids = list(getattr(self, "_session_ids", set()) or [])
+            if _sess_ids and self._session_supported_cached():
+                type(self)._session_clr(_sess_ids)
+                self._cloak_debug(f"disable SESION: sacadas {len(_sess_ids)}")
+        except Exception:
+            pass
+        self._session_ids = set()
         prev = self._prev_blacklist
-        self._prev_blacklist = None
         prev_active = self._prev_active
+        if not managed and not self._managed_whitelist_path and prev_active is None and prev is None:
+            if getattr(self, "_pending_blacklist_ids", set()) or getattr(self, "_pending_whitelist_path", None):
+                return False, ("hay entradas PENDING sin confirmación de propiedad; se preservaron. "
+                               "Reinicia la app para que el arranque las resuelva, o revísalas en HidHide Client.")
+            return True, "no hay cambios de HidHide propiedad de DualSense Studio"
+        self._cloak_ids = None
+        self._preexisting_ids = None
+        self._prev_blacklist = None
         self._prev_active = None
         ok_cur, cur_bl = self._get_blacklist_detailed()
         if not ok_cur:
@@ -789,24 +1426,21 @@ class HidHideController:
             # intentar restaurar lo guardado, como antes.
             if prev is not None:
                 self.set_blacklist([p for p in prev
-                                    if p.lower() not in removal
+                                    if p.lower() not in managed
                                     and p.strip().upper() != 'HID'])
             if prev_active is not None and not prev_active:
                 self.set_active(False)
             self._cloak_debug("disable SIN LECTURA: restauracion parcial")
-            return
+            return False, f"no se pudo leer blacklist ({self._open_error_text()}); no se modificó"
         cur_bl = [p for p in cur_bl if p.strip().upper() != 'HID']
         new_bl = []
         for p in cur_bl:
-            if p.lower() in removal:
+            if p.lower() in managed:
                 continue
-            if self._is_sony_entry(p):
-                continue  # entrada Sony: nuestro mando (o un DualSense)
             new_bl.append(p)
         if prev:
             for p in prev:
-                if (p.strip().upper() == 'HID' or p.lower() in removal
-                        or self._is_sony_entry(p)):
+                if (p.strip().upper() == 'HID' or p.lower() in managed):
                     continue
                 if not any(p.lower() == q.lower() for q in new_bl):
                     new_bl.append(p)
@@ -818,6 +1452,26 @@ class HidHideController:
             self.set_active(False)
         ok2, cur2 = self._get_blacklist_detailed()
         self._cloak_debug(f"disable restaura={prev} nueva={new_bl} relectura={cur2 if ok2 else 'FALLO'}")
+        if ok2 and any(p.lower() in managed for p in cur2):
+            self._cloak_debug("disable: la verificación de blacklist falló")
+            return False, "no se pudo verificar la eliminación de las entradas propias"
+        wl_ok = self._restore_owned_whitelist()
+        if not wl_ok:
+            self._managed_blacklist_ids = set(managed)
+            self._prev_active = prev_active
+            self._save_owned_state()
+            return False, "cloak desactivado, pero no se pudo retirar la exención propia de whitelist"
+        self._managed_blacklist_ids.clear()
+        self._managed_whitelist_path = None
+        self._save_owned_state()
+        if getattr(self, "_pending_blacklist_ids", set()) or getattr(self, "_pending_whitelist_path", None):
+            return False, ("cloak desactivado, pero hay entradas PENDING sin confirmación de propiedad; "
+                           "se preservaron. Reinicia la app para que el arranque las resuelva, "
+                           "o revísalas en HidHide Client.")
+        if not self._managed_blacklist_ids and not self._managed_whitelist_path and self._prev_active is None:
+            self._clear_owned_state_file()
+        return True, "cloak desactivado; se preservaron las demás entradas de HidHide"
+
 
 
 class DualSenseHardware:
@@ -826,35 +1480,79 @@ class DualSenseHardware:
         self.is_bluetooth = False
         self.connected = False
         self.hid_path = None  # para el cloak de HidHide
+        self._last_read_kind = "closed"  # FIX v0.1.16: ok/empty/invalid/error
+        self._hid_lock = threading.Lock()  # FIX v0.1.18 (Claude p4): el HID fisico lo tocan el worker (read) y la UI (send_packet); sin candado dos hilos escriben/leer el mismo dispositivo a la vez.
 
     def connect(self):
+        if self.connected and self.device:
+            return True
+        # No conservar handles parciales si una interfaz falla al abrirse.
         for dev in hid.enumerate(SONY_VID):
-            if dev['product_id'] in DUALSENSE_PIDS:
-                self.device = hid.device()
-                self.device.open_path(dev['path'])
-                self.device.set_nonblocking(1)
-                self.hid_path = dev['path']
-
+            if dev.get('product_id') not in DUALSENSE_PIDS:
+                continue
+            candidate = None
+            try:
+                candidate = hid.device()
+                candidate.open_path(dev['path'])
+                candidate.set_nonblocking(1)
                 time.sleep(0.05)
-                sample = self.device.read(128)
-                if sample and (sample[0] == 0x31 or len(sample) > 64):
-                    self.is_bluetooth = True
+                sample = candidate.read(128)
+                # FIX v0.1.16 (GPT plan 3): el transporte se decide
+                # PRIMERO por la ruta del dispositivo (BT: BTHENUM o
+                # el GUID 00001124 / VID&0002054C; USB: 'USB'), que no
+                # depende de que llegue un reporte. El reporte
+                # (0x31 o >64 bytes) y el interface_number quedan como
+                # respaldo si la ruta no dice nada.
+                _path_s = dev.get('path', b'')
+                if isinstance(_path_s, (bytes, bytearray)):
+                    _path_s = _path_s.decode('utf-8', 'ignore')
+                _path_u = str(_path_s).upper()
+                if 'BTHENUM' in _path_u or 'VID&0002054C' in _path_u or '00001124' in _path_u:
+                    is_bluetooth = True
+                elif 'USB' in _path_u:
+                    is_bluetooth = False
                 else:
-                    self.is_bluetooth = (dev.get('interface_number', -1) == -1)
-
+                    is_bluetooth = bool(sample and (sample[0] == 0x31 or len(sample) > 64))
+                    if not is_bluetooth:
+                        is_bluetooth = (dev.get('interface_number', -1) == -1)
+                self.device = candidate
+                self.hid_path = dev['path']
+                self.is_bluetooth = is_bluetooth
                 self.connected = True
                 return True
+            except Exception:
+                try:
+                    if candidate is not None:
+                        candidate.close()
+                except Exception:
+                    pass
+                continue
+        self.device = None
+        self.hid_path = None
+        self.is_bluetooth = False
+        self.connected = False
         return False
 
     def close(self):
-        if self.device:
+        device = self.device
+        if device is not None:
             try:
+                # Enviar neutral mientras el estado sigue conectado.
                 self.send_packet({"mode": "Desactivado"}, {"mode": "Desactivado"}, [0, 0, 0], 0, 0)
-                self.device.close()
             except Exception:
                 pass
-        self.device = None
-        self.connected = False
+            finally:
+                self.connected = False
+                self.device = None
+                try:
+                    device.close()
+                except Exception:
+                    pass
+        else:
+            self.connected = False
+            self.device = None
+        self.hid_path = None
+        self.is_bluetooth = False
 
     @staticmethod
     def build_trigger_bytes(cfg):
@@ -945,7 +1643,8 @@ class DualSenseHardware:
         try:
             if not self.is_bluetooth:
                 pkt = bytearray([0x02]) + common
-                self.device.write(pkt)
+                with self._hid_lock:
+                    self.device.write(pkt)
             else:
                 pkt = bytearray(78)
                 pkt[0] = 0x31
@@ -958,7 +1657,8 @@ class DualSenseHardware:
                 pkt[75] = (crc >> 8) & 0xFF
                 pkt[76] = (crc >> 16) & 0xFF
                 pkt[77] = (crc >> 24) & 0xFF
-                self.device.write(pkt)
+                with self._hid_lock:
+                    self.device.write(pkt)
         except Exception:
             pass
 
@@ -1000,8 +1700,10 @@ class DualSenseHardware:
         if not self.connected or not self.device:
             return None
         try:
-            data = self.device.read(128)
+            with self._hid_lock:
+                data = self.device.read(128)
         except Exception:
+            self._last_read_kind = "error"
             return None
 
         if not data:
@@ -1012,17 +1714,33 @@ class DualSenseHardware:
             if st["acc"] == 0 and st["rej"] == 0 and st["empty"] == 500 and not st["nodata"]:
                 st["nodata"] = True
                 self._report_dbg_write("SIN DATOS: 500 lecturas vacias seguidas, el control no entrega reportes")
+            self._last_read_kind = "empty"
             return None
 
         rid = data[0]
         if rid == 0x01 and len(data) >= 10:
             off = 1
-            full_report = (len(data) >= 40)
+            # FIX v0.1.18 (Claude p5, verificado en el fuente de SDL
+            # SDL_hidapi_ps5.c): el reporte SIMPLE 0x01 (10 bytes, y
+            # tambien el 0x01 de 78 bytes) lleva el orden DS4: palos,
+            # botones y LUEGO gatillos (PS5SimpleStatePacket_t). El
+            # completo (USB 0x01 de 64 bytes) lleva gatillos antes que
+            # botones. La 0.1.15 lo habia invertido con una suposicion
+            # sin verificar; el codigo original tenia razon.
+            if len(data) == 10 or len(data) == 78:
+                full_report = False
+            elif len(data) >= 40:
+                full_report = True
+            else:
+                self._report_dbg_reject(data, rid)
+                self._last_read_kind = "invalid"
+                return None
         elif rid == 0x31 and len(data) >= 45:
             off = 2
             full_report = True
         else:
             self._report_dbg_reject(data, rid)
+            self._last_read_kind = "invalid"
             return None
         self._report_dbg_accept(data, rid)
 
@@ -1036,9 +1754,12 @@ class DualSenseHardware:
             st["R2"] = data[off + 5]
             b0, b1, b2 = data[off + 7], data[off + 8], data[off + 9]
         else:
+            # Reporte simple BT (SDL PS5SimpleStatePacket_t): botones
+            # en off+4..6 y gatillos al final (off+7, off+8). En 10
+            # bytes caben justos: palos 0-3, botones 4-6, gatillos 7-8.
             b0, b1, b2 = data[off + 4], data[off + 5], data[off + 6]
-            st["L2"] = data[off + 7] if len(data) > off + 8 else 0
-            st["R2"] = data[off + 8] if len(data) > off + 8 else 0
+            st["L2"] = data[off + 7]
+            st["R2"] = data[off + 8]
 
         hat = b0 & 0x0F
         st["up"] = hat in (0, 1, 7)
@@ -1073,16 +1794,41 @@ class DualSenseHardware:
 
         # FIX 9: bateria. Byte en off+52 (pydualsense lee states[53]
         # normalizado; BT trae 1 byte extra -> off+52 vale en ambas).
-        if len(data) > off + 52:
+        # FIX v0.1.13 (bateria 5% en BT): el parse aceptaba reportes
+        # CORTOS (BT 0x01 sin bateria) y confiaba en el byte 53/54 sin
+        # verificar que el reporte estuviera completo. Si el byte leido
+        # es 0 (o el reporte no trae bateria), la formula da exactamente
+        # 5% y el extendido mandaba 0 a Steam. Solo se usa el byte si el
+        # reporte es COMPLETO (0x01 -> 64 bytes, 0x31 -> 78), y si no lo
+        # es, se CONSERVA el ultimo valor bueno en vez de mandar 0.
+        # FIX v0.1.14 (GPT, bateria 5% con el mando LLENO): status 2 =
+        # cargado completo; un mando lleno reporta nivel 0 y la formula
+        # daba 5%. Cargado = 100%, nibble 10.
+        _full_len = 78 if rid == 0x31 else 64
+        _lvl = _nib = None
+        _chg_flag = False
+        # FIX v0.1.18: un 0x01 de 78 bytes es orden SIMPLE (SDL) y su
+        # byte de bateria NO esta en el offset del layout de 64; no
+        # leerlo (se conserva el ultimo valor bueno).
+        if len(data) >= _full_len and len(data) > off + 52 and not (rid == 0x01 and len(data) == 78):
             batt = data[off + 52]
-            st["batt_level"] = min((batt & 0x0F) * 10 + 5, 100)
-            st["batt_nibble"] = batt & 0x0F  # 0-10, escala DS4: se reenvia tal cual al DS4 virtual
-            st["batt_charging"] = ((batt & 0xF0) >> 4) == 0x1
-        else:
-            st["batt_level"] = None
-            st["batt_nibble"] = None
-            st["batt_charging"] = False
+            _lvl_nib = batt & 0x0F
+            _chg = (batt >> 4) & 0x0F
+            if _chg == 2:
+                _lvl, _nib, _chg_flag = 100, 10, False
+            elif _chg in (0, 1) and _lvl_nib <= 10:
+                _lvl = min(_lvl_nib * 10 + 5, 100)
+                _nib = _lvl_nib  # 0-10, escala DS4: se reenvia tal cual al DS4 virtual
+                _chg_flag = (_chg == 1)
+        if _nib is None and getattr(self, "_last_batt", None) is not None:
+            _lvl, _nib, _chg_flag = self._last_batt
+        if _nib is not None:
+            self._last_batt = (_lvl, _nib, _chg_flag)
+        st["batt_level"] = _lvl
+        st["batt_nibble"] = _nib
+        st["batt_charging"] = _chg_flag
 
+        self._last_read_kind = "ok"
         return st
 
 
@@ -1107,9 +1853,41 @@ class DualSenseStudioApp(ctk.CTk):
 
         self.hw = DualSenseHardware()
         self.hidcloak = HidHideController()
+        # FIX v0.1.15 (GPT high): al arrancar, limpiar en segundo plano
+        # cualquier entrada Sony atorada en la blacklist (crash/apagado
+        # con el cloak puesto); el cloak solo se aplica despues de eso.
+        self.hidcloak.begin_startup_cleanup()
+        # FIX v0.1.16: si la limpieza de arranque encontro entradas Sony
+        # AJENAS (no registradas por la app), preguntar UNA sola vez si
+        # se quitan (pueden ser restos de versiones viejas sin journal).
+        try:
+            self.after(15000, self._check_startup_cleanup_legacy)
+        except Exception:
+            pass
         self.virtual_pad = None
+        # FIX v0.1.15 (GPT): candado del pad virtual — el worker, el
+        # setup y el destroy tocan el mismo pad; sin lock, destruirlo
+        # mientras el worker hace update() es una carrera.
+        self._pad_lock = threading.RLock()
         self.emulation_type = "DS4"  # default PS4 (se confirma al crear el selector)
         self.running_thread = False
+        # FIX v0.1.15 punto 18: generación del servicio (cada start/stop
+        # suma 1): una parada por mando perdido agendada con after(0)
+        # que llegue tarde se ignora si ya hay otra generación en curso.
+        self._service_gen = 0
+        # FIX v0.1.15: desconexión manual (solo en memoria: al reiniciar
+        # la app el monitor vuelve a conectar solo, por decisión de Pedro).
+        self._manual_disconnect = False
+        # FIX v0.1.15: foto de la UI para el hilo worker (Tkinter es de un
+        # solo hilo: el worker NUNCA toca widgets; solo lee esta foto).
+        self._ui_snap = None
+        self._ui_batt_pending = None
+        # FIX v0.1.15 punto 6: candado de instalacion OTA (una sola
+        # instalacion a la vez: el aviso idle y Ajustes comparten
+        # _ota_start_install y dos hilos se pisaban el .new.download).
+        self._ota_installing = False
+        self._ota_install_lock = threading.Lock()
+        self._whitelist_warned = False  # FIX v0.1.18 (Claude p6): el aviso de whitelist fallido, una sola vez por sesion.
         self.tray_icon = None
         # FIX 5: rumble real via callback de vgamepad (0-255)
         self.rumble_large = 0
@@ -1192,10 +1970,18 @@ class DualSenseStudioApp(ctk.CTk):
 
         # Auto-conexión: intenta conectar al iniciar, y reintenta cada 5s hasta lograrlo
         self.after(1500, self._try_auto_connect)
+        # Foto de la UI para el hilo worker: se actualiza cada 100 ms en el
+        # hilo principal; el worker solo lee la foto, nunca los widgets.
+        self._ui_snapshot_tick()
         # Detección de juegos: revisa cada 1s (proceso activo o ventana al frente)
         self.after(1000, self._game_detect_tick)
         # Actualizaciones: primer chequeo a los 10s (en hilo, nunca frena la UI)
         self.after(10000, lambda: self._ota_check_in_background(False))
+        # FIX v0.1.18 (Claude p2): marcador de arranque sano para el
+        # actualizador, ~10 s despues de abrir la app.
+        self.after(10000, self._ota_write_boot_ok)
+        # FIX v0.1.18 (Program Files): sonda de escritura de la carpeta.
+        self.after(2000, self._check_base_dir_writable)
 
     def _game_detect_tick(self):
         """Tick periódico (hilo principal) para el perfil automático por juego."""
@@ -1209,28 +1995,79 @@ class DualSenseStudioApp(ctk.CTk):
             pass
         self.after(1000, self._game_detect_tick)
 
-    def _try_auto_connect(self):
-        """Monitor persistente: conecta al iniciar y reconecta si el mando se apaga/desconecta."""
-        if not self.hw.connected:
-            # No conectado: intentar conectar
-            self.start_service()
-        else:
-            # Conectado: verificar que el dispositivo siga presente
-            still_there = False
+    def _ui_snapshot_tick(self):
+        """Foto de la UI para el hilo worker (corre en el hilo principal).
+        Copia los valores de los controles a atributos normales cada 100 ms;
+        el worker solo lee esa foto, nunca los widgets (Tkinter es de un
+        solo hilo). También aplica en el hilo principal el texto de bateria
+        que el worker deja pendiente."""
+        try:
+            _snap = self.collect_ui_state()
+            _sw = getattr(self, "touch_switch", None)
+            _snap["touch_on"] = bool(_sw.get()) if _sw is not None else False
+            self._ui_snap = _snap
+            if self._ui_batt_pending is not None:
+                try:
+                    self.batt_label.configure(text=self._ui_batt_pending)
+                except Exception:
+                    pass
+                self._ui_batt_pending = None
+        except Exception:
+            pass
+        finally:
             try:
-                for dev in hid.enumerate(SONY_VID):
-                    if dev['path'] == self.hw.hid_path:
-                        still_there = True
-                        break
+                self.after(100, self._ui_snapshot_tick)
             except Exception:
                 pass
-            if not still_there:
-                # El mando se apagó o desconectó: limpiar para reconectar en el próximo tick
-                self.stop_service()
-                self.status_label.configure(text="● Mando desconectado, buscando...", text_color="#fbbf24")
-                self.connect_btn.configure(text="Conectar", fg_color="#3b82f6", hover_color="#2563eb")
-        # Siempre reprogramar (cada 5s)
-        self.after(5000, self._try_auto_connect)
+
+    def _try_auto_connect(self):
+        """Monitor persistente: conecta al iniciar y reconecta si el mando se apaga/desconecta."""
+        try:
+            # Desconexión manual: no reconectar hasta que el usuario pulse Conectar.
+            if self._manual_disconnect:
+                return
+            if not self.hw.connected:
+                # No conectado: intentar conectar
+                self.start_service()
+            else:
+                # Conectado: verificar que el dispositivo siga presente
+                still_there = False
+                try:
+                    for dev in hid.enumerate(SONY_VID):
+                        if dev['path'] == self.hw.hid_path:
+                            still_there = True
+                            break
+                except Exception:
+                    pass
+                if not still_there:
+                    # El mando se apagó o desconectó: limpiar para reconectar en el próximo tick
+                    self.stop_service()
+                    self.status_label.configure(text="● Mando desconectado, buscando...", text_color="#fbbf24")
+                    self.connect_btn.configure(text="Conectar", fg_color="#3b82f6", hover_color="#2563eb")
+                else:
+                    # FIX v0.1.15 punto 7: el hilo worker pudo morir sin
+                    # que nadie lo note (la etiqueta seguiria en
+                    # 'Conectado'): si dice conectado pero el hilo no
+                    # esta vivo, limpiar para reconectar en el proximo tick.
+                    try:
+                        _wt = getattr(self, "_worker_thread", None)
+                        if (getattr(self, "running_thread", False)
+                                and _wt is not None and not _wt.is_alive()):
+                            self._debug_log_write("WATCHDOG: worker muerto con estado Conectado, reiniciando")
+                            self.stop_service()
+                            self.status_label.configure(text="● Mando desconectado, buscando...", text_color="#fbbf24")
+                            self.connect_btn.configure(text="Conectar", fg_color="#3b82f6", hover_color="#2563eb")
+                    except Exception:
+                        pass
+        except Exception as e:
+            # El monitor nunca debe morir: registrar el fallo y seguir.
+            try:
+                self._debug_log_write(f"AUTO-CONNECT FAIL: {e!r}")
+            except Exception:
+                pass
+        finally:
+            # Siempre reprogramar (cada 5s)
+            self.after(5000, self._try_auto_connect)
 
     def _on_touch_switch_changed(self):
         """Ratón táctil GLOBAL: solo el interruptor lo cambia; se guarda
@@ -1248,8 +2085,13 @@ class DualSenseStudioApp(ctk.CTk):
         dio a Guardar. Se conserva el método para no tocar los llamadores."""
         return
 
-    def _on_device_lost(self):
+    def _on_device_lost(self, gen=None):
         """El worker detectó que el mando se desconectó físicamente."""
+        # FIX v0.1.15 punto 18: la llamada se agenda con after(0) y puede
+        # llegar tarde: si entre medias ya hubo otro start/stop (otra
+        # generación de servicio), ignorarla para no tumbar el servicio nuevo.
+        if gen is not None and gen != getattr(self, "_service_gen", 0):
+            return
         if not self.hw.connected:
             self.stop_service()
             # El monitor _try_auto_connect lo reconectará cuando vuelva
@@ -1271,7 +2113,12 @@ class DualSenseStudioApp(ctk.CTk):
                 with open(PROFILES_FILE, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                 for k, v in saved.items():
-                    merged[k] = dict(v) if isinstance(v, dict) else v
+                    # FIX v0.1.15 M26: un valor guardado que no sea un
+                    # diccionario (archivo corrupto) se descarta; si no,
+                    # el .get() de más abajo reventaba con AttributeError.
+                    # Si el nombre era de serie, queda su perfil de fábrica.
+                    if isinstance(v, dict):
+                        merged[k] = dict(v)
             except Exception:
                 pass
         return merged
@@ -1288,9 +2135,18 @@ class DualSenseStudioApp(ctk.CTk):
             except Exception:
                 pass
         tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            # FIX v0.1.15 M24: si el guardado falla, no dejar el .tmp
+            # huérfano en la carpeta. El error sigue subiendo igual.
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            raise
 
     def save_profiles_to_disk(self):
         self._atomic_json_write(PROFILES_FILE, self.profiles)
@@ -1376,18 +2232,88 @@ class DualSenseStudioApp(ctk.CTk):
             self.tray_icon = None  # sin tray no se muere la app
 
     def hide_to_tray(self):
+        # FIX v0.1.13 (GPT: el arranque con --tray depende del icono):
+        # si el icono del tray no se pudo crear (pystray fallo, algo
+        # tipico en el arranque rapido de Windows), NO esconder la
+        # ventana: la app quedaria invisible sin forma de abrirla. Se
+        # reintenta crear el icono una vez; si sigue sin haberlo, la
+        # ventana queda visible.
+        if self.tray_icon is None:
+            try:
+                self.setup_system_tray()
+            except Exception:
+                pass
+        if self.tray_icon is None:
+            return
         self.withdraw()
 
     def show_from_tray(self, icon=None, item=None):
         self.after(0, self.deiconify)
 
     def quit_app(self, icon=None, item=None):
+        # FIX v0.1.13/v0.1.14 (OTA rota): cada paso de cierre protegido
+        # por separado (try/finally). Antes, si hidcloak.disable() o
+        # hw.close() lanzaban una excepcion, el resto no corria y la app
+        # quedaba abierta — el actualizador esperaba para siempre a que
+        # el proceso desapareciera. La guarda _quit_started (GPT) evita
+        # dobles cierres desde el hilo de pystray y la GUI. La ventana se
+        # destruye siempre, pase lo que pase.
+        # FIX v0.1.15 M23: el cierre normal no desmontaba el servicio
+        # (el worker quedaba vivo hasta el destroy y el pad no se
+        # destruía explícitamente); la OTA sí lo hacía bien con
+        # _ota_teardown_and_quit. Ahora el cierre pasa por el mismo
+        # desmontaje. El desmontaje toca widgets, así que siempre corre
+        # en el hilo principal vía after(0, ...), venga del menú del
+        # tray (hilo de pystray) o de la GUI.
+        if getattr(self, "_quit_started", False):
+            return
+        self._quit_started = True
+        try:
+            self.after(0, self._quit_app_main)
+        except Exception:
+            try:
+                self.destroy()
+            except Exception:
+                pass
+
+    def _quit_app_main(self):
+        # Desmontar el servicio limpio (unir el worker, destruir el pad
+        # virtual), igual que _ota_teardown_and_quit.
+        try:
+            self.stop_service()
+        except Exception:
+            pass
         self.running_thread = False
-        self.hidcloak.disable()  # restaura tu blacklist/Active previos de HidHide
-        self.hw.close()
-        if self.tray_icon:
-            self.tray_icon.stop()
-        self.after(0, self.destroy)
+        try:
+            try:
+                if getattr(self, "hidcloak", None):
+                    self.hidcloak.disable()  # restaura tu blacklist/Active previos de HidHide
+            except Exception as exc:
+                try:
+                    self._debug_log_write(f"Cierre: HidHide no pudo restaurarse: {exc}")
+                except Exception:
+                    pass
+            try:
+                if getattr(self, "hw", None):
+                    self.hw.close()
+            except Exception as exc:
+                try:
+                    self._debug_log_write(f"Cierre: hardware no pudo cerrarse: {exc}")
+                except Exception:
+                    pass
+            try:
+                if getattr(self, "tray_icon", None):
+                    self.tray_icon.stop()
+            except Exception:
+                pass
+        finally:
+            try:
+                self.after(0, self.destroy)
+            except Exception:
+                try:
+                    self.destroy()
+                except Exception:
+                    pass
 
     # ==========================================================================
     # INTERFAZ GRAFICA ESTILO ONE UI (igual que el diseno original)
@@ -1476,6 +2402,12 @@ class DualSenseStudioApp(ctk.CTk):
         ).pack(side="left", padx=12)
 
         # FIX 8: iniciar con Windows
+        # FIX v0.1.12: migra el mecanismo viejo en segundo plano (ver
+        # _autostart_migrate_if_needed): si el exe quedo con solo la
+        # clave Run (de la epoca sin --uac-admin), Windows bloquea su
+        # arranque y el switch miente. La migracion crea la tarea y
+        # quita la clave. En hilo aparte para no frenar el arranque.
+        threading.Thread(target=self._autostart_migrate_if_needed, daemon=True).start()
         self.autostart_switch = ctk.CTkSwitch(
             top_row3, text="Iniciar con Windows", font=("Segoe UI", 12),
             command=self.on_autostart_toggle, progress_color="#3b82f6"
@@ -1920,59 +2852,82 @@ class DualSenseStudioApp(ctk.CTk):
 
     @staticmethod
     def _autostart_command():
+        # FIX v0.1.14 (GPT): list2cmdline cita bien las rutas con espacios.
         if getattr(sys, 'frozen', False):
-            return f'"{sys.executable}" --tray'
-        pyw = sys.executable.replace('python.exe', 'pythonw.exe')
+            return subprocess.list2cmdline([os.path.abspath(sys.executable), '--tray'])
+        python_exe = os.path.abspath(sys.executable)
+        if os.path.basename(python_exe).lower() == 'python.exe':
+            python_exe = os.path.join(os.path.dirname(python_exe), 'pythonw.exe')
         script = os.path.abspath(__file__)
-        return f'"{pyw}" "{script}" --tray'
+        return subprocess.list2cmdline([python_exe, script, '--tray'])
 
     @classmethod
     def _runkey_get(cls):
         try:
             import winreg
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
-                winreg.QueryValueEx(k, cls.AUTOSTART_NAME)
-                return True
+                                r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+                value, _ = winreg.QueryValueEx(key, cls.AUTOSTART_NAME)
+                return bool(value)
         except (FileNotFoundError, OSError, ImportError):
             return False
 
     @classmethod
     def _runkey_set(cls, enable):
+        # FIX v0.1.14 (GPT): CreateKey crea la clave si no existe y se
+        # verifica que quedo escrita.
         import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                            r"Software\Microsoft\Windows\CurrentVersion\Run",
-                            0, winreg.KEY_SET_VALUE) as k:
-            if enable:
-                winreg.SetValueEx(k, cls.AUTOSTART_NAME, 0,
+        run_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        if enable:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, run_path) as key:
+                winreg.SetValueEx(key, cls.AUTOSTART_NAME, 0,
                                   winreg.REG_SZ, cls._autostart_command())
-            else:
-                try:
-                    winreg.DeleteValue(k, cls.AUTOSTART_NAME)
-                except FileNotFoundError:
-                    pass
+            if not cls._runkey_get():
+                raise RuntimeError("Windows no confirmó la entrada de inicio automático.")
+        else:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_path,
+                                    0, winreg.KEY_SET_VALUE) as key:
+                    try:
+                        winreg.DeleteValue(key, cls.AUTOSTART_NAME)
+                    except FileNotFoundError:
+                        pass
+            except FileNotFoundError:
+                pass
 
     @classmethod
     def _task_exists(cls):
         try:
-            r = subprocess.run(['schtasks', '/query', '/tn', cls.AUTOSTART_TASK],
-                               capture_output=True, timeout=15)
-            return r.returncode == 0
+            result = subprocess.run(
+                ['schtasks', '/query', '/tn', cls.AUTOSTART_TASK],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            return result.returncode == 0
         except Exception:
             return False
 
     @classmethod
     def _task_set(cls, enable):
+        # FIX v0.1.14 (GPT): al crear, verifica que la tarea quedo y
+        # lanza RuntimeError con el detalle de schtasks si falla. Al
+        # borrar, que la tarea ya no exista tambien es exito.
         if enable:
-            r = subprocess.run(
+            result = subprocess.run(
                 ['schtasks', '/create', '/tn', cls.AUTOSTART_TASK,
-                 '/tr', cls._autostart_command(),
-                 '/sc', 'onlogon', '/rl', 'highest', '/f'],
-                capture_output=True, text=True, timeout=30)
-            return r.returncode == 0
-        r = subprocess.run(['schtasks', '/delete', '/tn', cls.AUTOSTART_TASK, '/f'],
-                           capture_output=True, timeout=15)
-        return r.returncode == 0
+                 '/tr', cls._autostart_command(), '/sc', 'onlogon',
+                 '/rl', 'highest', '/f'],
+                capture_output=True, text=True, timeout=30,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            if result.returncode != 0 or not cls._task_exists():
+                detail = (result.stderr or result.stdout or '').strip()
+                raise RuntimeError(detail or "Windows no pudo crear/verificar la tarea programada.")
+            return True
+        result = subprocess.run(
+            ['schtasks', '/delete', '/tn', cls.AUTOSTART_TASK, '/f'],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        # La tarea puede no existir; eso también significa que está desactivada.
+        return result.returncode == 0 or not cls._task_exists()
 
     @classmethod
     def get_autostart(cls):
@@ -1982,42 +2937,136 @@ class DualSenseStudioApp(ctk.CTk):
     def set_autostart(cls, enable):
         if enable:
             if HidHideController.is_admin():
-                if cls._task_set(True):
-                    cls._runkey_set(False)  # evita doble arranque
-                    return
+                # Un EXE marcado --uac-admin no debe depender de HKCU\Run:
+                # eso provocaría un prompt UAC al iniciar sesión. La tarea
+                # programada ejecuta la app con el nivel elevado ya autorizado.
+                try:
+                    cls._task_set(True)
+                except Exception:
+                    # FIX v0.1.12: sin tarea NO hay autostart para un exe
+                    # con admin (Windows bloquea la clave Run). Limpiar la
+                    # clave para que el switch no quede prendido mintiendo.
+                    try:
+                        cls._runkey_set(False)
+                    except OSError:
+                        pass
+                    raise
+                try:
+                    cls._runkey_set(False)
+                except OSError:
+                    pass
+                return
             cls._runkey_set(True)
+            if not cls._runkey_get():
+                raise RuntimeError("No se pudo verificar el inicio automático en el registro de Windows.")
         else:
-            cls._task_set(False)
+            task_error = None
+            try:
+                cls._task_set(False)
+            except Exception as exc:
+                task_error = exc
             cls._runkey_set(False)
+            if cls.get_autostart():
+                raise RuntimeError(str(task_error or "No se pudo desactivar el inicio automático."))
+
+    @classmethod
+    def _task_command_matches(cls):
+        """True si la tarea programada apunta al exe actual. FIX v0.1.13
+        (GPT: no se verificaba la configuracion de la tarea): una tarea
+        vieja puede apuntar a un exe movido o recompilado y
+        get_autostart() seguiria diciendo que si."""
+        try:
+            r = subprocess.run(['schtasks', '/query', '/tn', cls.AUTOSTART_TASK, '/xml'],
+                               capture_output=True, text=True, timeout=15,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            if r.returncode != 0:
+                return False
+            m = re.search(r"<Command>(.*?)</Command>", r.stdout, re.IGNORECASE | re.DOTALL)
+            if not m:
+                return False
+            # FIX v0.1.15 punto 5: comparar SOLO el programa, no el comando
+            # completo. _autostart_command() escribe el exe (a veces entre
+            # comillas) + ' --tray', y schtasks puede guardar comillas o
+            # argumentos dentro de <Command>: comparar todo eso contra el
+            # exe solo siempre fallaba y la migracion recreaba la tarea
+            # en cada arranque.
+            _cmd = m.group(1).strip()
+            if _cmd.startswith('"'):
+                _prog = _cmd[1:].split('"', 1)[0]
+            else:
+                _prog = _cmd.split(None, 1)[0] if _cmd else ""
+            if getattr(sys, "frozen", False):
+                _want = sys.executable
+            else:
+                _want = sys.executable.replace("python.exe", "pythonw.exe")
+            return os.path.normcase(os.path.normpath(_prog)) == os.path.normcase(os.path.normpath(_want))
+        except Exception:
+            return False
+
+    @classmethod
+    def _autostart_migrate_if_needed(cls):
+        """FIX v0.1.12/v0.1.13 (Iniciar con Windows no arranca): migracion
+        del mecanismo viejo. En las primeras versiones el exe NO pedia
+        admin y el switch guardaba la clave Run de HKCU; desde que el exe
+        se compila con --uac-admin, Windows bloquea el arranque por Run y
+        el switch seguia prendido mintiendo (la clave existe). Si el exe
+        (con admin) tiene solo la clave Run y no hay tarea, crea la
+        tarea y quita la clave. FIX v0.1.13: tambien recrea la tarea si
+        existe pero apunta a un exe viejo. Silencioso: si falla, deja
+        todo como estaba."""
+        try:
+            if not getattr(sys, "frozen", False):
+                return
+            if not HidHideController.is_admin():
+                return
+            if cls._task_exists() and cls._task_command_matches():
+                return  # tarea buena, nada que hacer
+            if cls._task_exists():
+                # FIX v0.1.15 punto 5: NO borrar la tarea vieja antes de
+                # crear la nueva. _task_set(True) ya sobrescribe con /f;
+                # si la creacion falla, la tarea vieja sigue ahi y el
+                # autostart no se pierde en silencio.
+                pass
+            elif not cls._runkey_get():
+                return  # ni tarea ni Run: el switch esta apagado
+            cls._task_set(True)  # crea/sobrescribe la tarea (lanza si falla; se ignora aqui)
+            cls._runkey_set(False)
+        except Exception:
+            pass
 
     def on_autostart_toggle(self):
+        # FIX v0.1.15 punto 19: guardar lo intentado ANTES de aplicar.
+        _wanted = bool(self.autostart_switch.get())
         try:
-            self.set_autostart(bool(self.autostart_switch.get()))
+            self.set_autostart(_wanted)
         except Exception as e:  # noqa: BLE001
             self.show_alert("Iniciar con Windows", f"No se pudo cambiar:\n{e}")
-            # revierte el switch a su estado real
-            if self.get_autostart():
-                self.autostart_switch.select()
-            else:
-                self.autostart_switch.deselect()
+            # Revertir el switch a su estado ANTERIOR sin volver a
+            # preguntar al sistema: get_autostart() corre schtasks /query
+            # con 15 s de timeout y en el camino de error congelaba la UI.
+            # Si el cambio falló, el estado real es el anterior.
+            try:
+                if _wanted:
+                    self.autostart_switch.deselect()
+                else:
+                    self.autostart_switch.select()
+            except Exception:
+                pass
 
     def on_debug_log_toggle(self):
         self.debug_log_enabled = bool(self.debug_log_switch.get())
         if self.debug_log_enabled:
             try:
-                with open(os.path.join(BASE_DIR, "debug_hid.log"), "a", encoding="utf-8") as f:
-                    f.write(f"\n=== Log iniciado {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                _append_log_capped(os.path.join(BASE_DIR, "debug_hid.log"),
+                                   f"\n=== Log iniciado {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
             except Exception:
                 pass
 
     def _debug_log_write(self, msg):
         if not self.debug_log_enabled:
             return
-        try:
-            with open(os.path.join(BASE_DIR, "debug_hid.log"), "a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
-        except Exception:
-            pass
+        _append_log_capped(os.path.join(BASE_DIR, "debug_hid.log"),
+                           f"{time.strftime('%H:%M:%S')} {msg}\n")
 
     def on_hidhide_toggle(self):
         # El switch ahora SI configura el cloak (blacklist clasica por IOCTL, con restauracion).
@@ -2039,6 +3088,7 @@ class DualSenseStudioApp(ctk.CTk):
         # Steam quedaria sin ningun mando (fisico oculto, sin virtual),
         # asi que se cambia la emulacion a PS4 y se avisa.
         _on = bool(self.hidhide_switch.get())
+        _old_emu = self.emu_selector.get()
         if _on and self.emu_selector.get() == "Solo Triggers (Sin Emular)":
             self.emu_selector.set("DualShock 4 (PS4)")
             self.show_alert("Anti Doble-Input",
@@ -2057,7 +3107,22 @@ class DualSenseStudioApp(ctk.CTk):
             # stop_service limpia el cloak y cierra el fisico/virtual;
             # start_service recrea el virtual y re-aplica el cloak si
             # el switch esta encendido.
-            self.stop_service()
+            # FIX v0.1.15 (GPT, adaptado): si la limpieza del cloak no
+            # quedó confirmada, NO reiniciar: revertir switch y
+            # emulación y avisar, en vez de arrancar un segundo servicio
+            # sobre un cloak a medias. El journal conserva la propiedad
+            # para reintentarlo.
+            if not self.stop_service():
+                if _on:
+                    self.hidhide_switch.deselect()
+                else:
+                    self.hidhide_switch.select()
+                self.emu_selector.set(_old_emu)
+                self.show_alert("No se pudo cambiar Anti Doble-Input",
+                                "La limpieza anterior no quedó confirmada. "
+                                "No se inició otra instancia del worker.\n\n"
+                                "Revisa debug_hid.log y vuelve a intentarlo.")
+                return
             self.start_service()
         elif _on:
             if self.hw.connected:
@@ -2086,7 +3151,7 @@ class DualSenseStudioApp(ctk.CTk):
 
     def _enable_cloak(self):
         if not self.hw.hid_path:
-            return
+            return False
         instance_ids = HidHideController.pad_instance_ids(self.hw.hid_path)
         HidHideController._cloak_debug(f"hid_path={self.hw.hid_path} ids={instance_ids}")
         if not instance_ids:
@@ -2095,10 +3160,28 @@ class DualSenseStudioApp(ctk.CTk):
             ok, msg = self.hidcloak.enable(instance_ids)
         if not ok:
             self._debug_log_write(f"CLOAK FAIL: {msg}")
-            self.show_alert("Anti Doble-Input",
-                            f"No se pudo activar el cloak de HidHide:\n{msg}\n\n"
-                            f"Descarga: {HIDHIDE_URL}\n\n"
-                            "La app sigue funcionando sin anti doble-input.")
+            # FIX v0.1.15 (GPT): si el físico no se ocultó, dejar el
+            # virtual DS4 activo sería doble entrada. Fallback explícito
+            # al mando físico (Solo Triggers) y se avisa.
+            try:
+                self.hidhide_switch.deselect()
+                self.emu_selector.set("Solo Triggers (Sin Emular)")
+                self.setup_virtual_controller("Solo Triggers (Sin Emular)")
+            except Exception:
+                pass
+            # FIX v0.1.18 (Claude p6): desde .py el whitelist nunca
+            # aplica y cada cambio de perfil mostraba este aviso. El
+            # fallback (Solo Triggers) se hace siempre; el aviso, una
+            # sola vez por sesion. El fallo queda en el log cada vez.
+            if not getattr(self, "_whitelist_warned", False):
+                self._whitelist_warned = True
+                self.show_alert("Anti Doble-Input",
+                                f"No se pudo activar el cloak de HidHide:\n{msg}\n\n"
+                                f"Descarga: {HIDHIDE_URL}\n\n"
+                                "Para evitar doble entrada, se desactivó la emulación virtual "
+                                "y se dejó el DualSense físico. La app sigue funcionando sin anti doble-input.")
+            return False
+        return True
 
     def show_alert(self, title, message, parent=None):
         """Aviso pequeño. `parent` es la ventana que lo abrió (p. ej. el
@@ -2123,7 +3206,8 @@ class DualSenseStudioApp(ctk.CTk):
         try:
             dialog.update_idletasks()
             dialog.lift()
-            dialog.focus_force()
+            # FIX v0.1.15 punto 17: sin focus_force() — el aviso se ve
+            # (topmost + lift) sin robarle el foco al juego y minimizarlo.
         except Exception:
             pass
 
@@ -2150,35 +3234,7 @@ class DualSenseStudioApp(ctk.CTk):
                     g.pop("quick_switch", None)
 
     def delete_current_profile(self):
-        """Elimina el perfil actual si fue creado por el usuario (no los 4 por defecto)."""
-        name = self.current_profile_name
-        if not name:
-            self.show_alert("Ningún perfil seleccionado",
-                            "Elige un perfil primero.")
-            return
-        if name in DEFAULT_PROFILES:
-            self.show_alert("No se puede eliminar",
-                            f"'{name}' es un perfil predeterminado.\nSolo se pueden eliminar los perfiles que tú creaste.")
-            return
-        import tkinter.messagebox as msgbox
-        if not msgbox.askyesno("Eliminar perfil", f"¿Eliminar el perfil '{name}'?"):
-            return
-        del self.profiles[name]
-        self.save_profiles_to_disk()
-        # Quitarlo de juegos que lo usaban (perfil base y flechas)
-        self._scrub_deleted_profile_from_games(name)
-        self.save_game_profiles_to_disk()
-        # Volver al primer perfil
-        new_current = list(self.profiles.keys())[0]
-        self.profile_combo.configure(values=list(self.profiles.keys()))
-        self._on_profile_selected_manual(new_current)
-        self.profile_combo.set(new_current)
-        self.refresh_game_list_ui()
-        if self.tray_icon:
-            self.tray_icon.menu = self.build_tray_menu()
-
-    def delete_current_profile(self):
-        """Elimina el perfil actual si fue creado por el usuario (no los 4 por defecto)."""
+        """Elimina el perfil actual si fue creado por el usuario (no los 6 por defecto)."""
         name = self.current_profile_name
         if not name:
             self.show_alert("Ningún perfil seleccionado",
@@ -2235,12 +3291,21 @@ class DualSenseStudioApp(ctk.CTk):
             if not large:
                 return False
             hicon = large[0]
+            # FIX v0.1.15 punto 9: liberar los objetos GDI (antes cada
+            # juego agregado dejaba 3 handles atorados: DC de pantalla,
+            # DC de memoria y bitmap, sin ReleaseDC/DeleteDC/DeleteObject).
+            hdc_screen = None
+            hdc = None
+            hdc_mem = None
+            hbmp = None
+            old_bmp = None
             try:
-                hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
+                hdc_screen = win32gui.GetDC(0)
+                hdc = win32ui.CreateDCFromHandle(hdc_screen)
                 hbmp = win32ui.CreateBitmap()
                 hbmp.CreateCompatibleBitmap(hdc, 32, 32)
                 hdc_mem = hdc.CreateCompatibleDC()
-                hdc_mem.SelectObject(hbmp)
+                old_bmp = hdc_mem.SelectObject(hbmp)
                 win32gui.DrawIconEx(hdc_mem.GetHandleOutput(), 0, 0, hicon, 32, 32, 0, None, win32con.DI_NORMAL)
                 bmpinfo = hbmp.GetInfo()
                 bmpstr = hbmp.GetBitmapBits(True)
@@ -2250,6 +3315,29 @@ class DualSenseStudioApp(ctk.CTk):
                 img.save(save_path)
                 return True
             finally:
+                # Devolver el bitmap original antes de borrar nada.
+                try:
+                    if hdc_mem is not None and old_bmp is not None:
+                        hdc_mem.SelectObject(old_bmp)
+                except Exception:
+                    pass
+                try:
+                    if hdc_mem is not None:
+                        hdc_mem.DeleteDC()
+                except Exception:
+                    pass
+                try:
+                    if hbmp is not None:
+                        hbmp.DeleteObject()
+                except Exception:
+                    pass
+                # El DC de pantalla vino de GetDC: se suelta con
+                # ReleaseDC, nunca con DeleteDC.
+                try:
+                    if hdc_screen is not None:
+                        win32gui.ReleaseDC(0, hdc_screen)
+                except Exception:
+                    pass
                 win32gui.DestroyIcon(hicon)
         except Exception:
             return False
@@ -2335,12 +3423,6 @@ class DualSenseStudioApp(ctk.CTk):
             self.game_profiles[exe]["profile"] = profile_name
             self.save_game_profiles_to_disk()
             self.refresh_game_list_ui()
-
-    def _on_game_profile_changed(self, exe, profile_name):
-        # Compat: ya no se usa dropdown por fila, pero se conserva por seguridad
-        if exe in self.game_profiles:
-            self.game_profiles[exe]["profile"] = profile_name
-            self.save_game_profiles_to_disk()
 
     def remove_selected_game(self):
         """Botón 🗑 estilo OBS: elimina el juego seleccionado."""
@@ -2430,9 +3512,65 @@ class DualSenseStudioApp(ctk.CTk):
         except Exception:
             return None
 
+    def _ota_write_boot_ok(self):
+        """FIX v0.1.18 (Claude p2): prueba de arranque sano. El
+        actualizador (.bat) borra este archivo antes de relanzar y
+        espera a que el exe nuevo lo escriba (~10 s despues de
+        arrancar). Si aparece, la actualizacion quedo bien; si el
+        proceso murio antes de escribirlo, el .bat restaura el .bak.
+        Si no se puede escribir, no pasa nada: el marcador es solo
+        una senal, y el .bat deja la app como esta si sigue viva."""
+        try:
+            with open(OTA_BOOT_OK_FILE, "w", encoding="utf-8") as f:
+                f.write(f"OK {OTA_VERSION} {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        except Exception:
+            pass
+
+    def _check_base_dir_writable(self):
+        """FIX v0.1.18 (Program Files): sonda de escritura al arranque.
+        Todo lo que la app guarda vive junto al exe (ajustes, perfiles,
+        journal, logs, el .new de la OTA). Si la carpeta no se puede
+        escribir (p. ej. Program Files sin los permisos restablecidos
+        tras moverla a mano), nada se guardaria y el fallo seria
+        silencioso. Se avisa una sola vez al arrancar; la app sigue
+        funcionando, solo que sin guardar."""
+        try:
+            _probe = os.path.join(BASE_DIR, ".escritura_prueba.tmp")
+            with open(_probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            try:
+                os.remove(_probe)
+            except OSError:
+                pass
+        except Exception:
+            try:
+                self._debug_log_write("AVISO: la carpeta de la app no se puede escribir: " + BASE_DIR)
+            except Exception:
+                pass
+            try:
+                self.show_alert(
+                    "Carpeta sin escritura",
+                    "La app no puede escribir en su propia carpeta:\n" + BASE_DIR +
+                    "\n\nLos ajustes, perfiles y actualizaciones no se guardaran.\n\n"
+                    "Si la moviste a Program Files, restablece los permisos de la carpeta "
+                    "(Propiedades > Seguridad > Opciones avanzadas > Reemplazar permisos) "
+                    "o ejecuta la app como administrador.")
+            except Exception:
+                pass
+
     def _ota_check_in_background(self, manual=False):
         import threading
         if getattr(self, "_ota_checking", False):
+            if manual:
+                # FIX v0.1.15 punto 15: avisar en vez de quedarse callado.
+                try:
+                    lbl = getattr(self, "_ota_settings_status", None)
+                    if lbl is not None and lbl.winfo_exists():
+                        lbl.configure(text=f"Versión instalada: {OTA_VERSION}  •  Buscando actualizaciones…")
+                    else:
+                        self.show_alert("Buscando", "Ya hay una búsqueda de actualizaciones en curso.")
+                except Exception:
+                    pass
             return
         self._ota_checking = True
 
@@ -2448,7 +3586,12 @@ class DualSenseStudioApp(ctk.CTk):
                 self.after(0, lambda: self._ota_on_check_result(info, manual))
             except Exception:
                 pass
-        threading.Thread(target=_work, daemon=True).start()
+        try:
+            threading.Thread(target=_work, daemon=True).start()
+        except Exception:
+            # FIX v0.1.15 punto 15: si el hilo no arranca, soltar la bandera
+            # para que los chequeos no queden bloqueados para siempre.
+            self._ota_checking = False
 
     def _ota_fetch_latest(self):
         import urllib.request
@@ -2466,14 +3609,26 @@ class DualSenseStudioApp(ctk.CTk):
             return None
         asset_url = None
         sha_url = None
+        asset_size = None
         for a in data.get("assets") or []:
             if a.get("name") == OTA_ASSET_NAME:
                 asset_url = a.get("url")
+                asset_size = a.get("size")
             elif a.get("name") == OTA_ASSET_NAME + ".sha256":
                 sha_url = a.get("url")
         if not asset_url:
             return None
-        return {"tag": tag, "asset_url": asset_url, "sha_url": sha_url}
+        # FIX v0.1.16 (GPT plan 5): las URLs de descarga deben venir
+        # de la API oficial de GitHub. (Si el .sha256 viene de otro
+        # lado, se descarta y la instalacion se niega mas adelante por
+        # falta de hash, en vez de verificar contra un hash ajeno.)
+        from urllib.parse import urlparse as _urlparse
+        if _urlparse(asset_url).hostname != "api.github.com":
+            return None
+        if sha_url and _urlparse(sha_url).hostname != "api.github.com":
+            sha_url = None
+        return {"tag": tag, "asset_url": asset_url, "sha_url": sha_url,
+                "asset_size": asset_size}
 
     def _ota_on_check_result(self, info, manual=False):
         try:
@@ -2484,7 +3639,17 @@ class DualSenseStudioApp(ctk.CTk):
                     parent = dlg
             except Exception:
                 parent = None
-            if info is not None:
+            # FIX v0.1.15 punto 11: si la busqueda fallo (info None), no
+            # dejar el aviso viejo: limpiar lo disponible y marcar el
+            # fallo, para que Ajustes no ofrezca instalar algo que no se
+            # pudo verificar (antes el boton quedaba prendido y la
+            # busqueda manual mostraba el aviso viejo en vez de
+            # "No se pudo buscar").
+            if info is None:
+                self._ota_available = None
+                self._ota_last_check_failed = True
+            else:
+                self._ota_last_check_failed = False
                 tag = info.get("tag")
                 if _ota_is_newer(tag, OTA_VERSION):
                     if getattr(self, "_ota_available", None) is None or getattr(self, "_ota_available").get("tag") != tag:
@@ -2510,6 +3675,8 @@ class DualSenseStudioApp(ctk.CTk):
                 info = getattr(self, "_ota_available", None)
                 if info:
                     lbl.configure(text=f"Versión instalada: {OTA_VERSION}  •  Disponible: {info.get('tag')}")
+                elif getattr(self, "_ota_last_check_failed", False):
+                    lbl.configure(text=f"Versión instalada: {OTA_VERSION}  •  No se pudo verificar")
                 else:
                     lbl.configure(text=f"Versión instalada: {OTA_VERSION}  •  Al día")
             btn = getattr(self, "_ota_install_btn", None)
@@ -2589,7 +3756,8 @@ class DualSenseStudioApp(ctk.CTk):
             try:
                 win.update_idletasks()
                 win.lift()
-                win.focus_force()
+                # FIX v0.1.15 punto 17: sin focus_force() — el aviso se ve
+                # (topmost + lift) sin robar el foco.
             except Exception:
                 pass
             self._ota_prompt_win = win
@@ -2639,15 +3807,50 @@ class DualSenseStudioApp(ctk.CTk):
         if not getattr(sys, "frozen", False):
             self.show_alert("Solo .exe", "La actualización automática solo funciona con el .exe compilado, no desde el .py.")
             return
+        # FIX v0.1.15 punto 6: una sola instalacion OTA a la vez. El aviso
+        # idle y el boton de Ajustes llegan los dos aqui; sin candado, dos
+        # hilos escribian el mismo .new.download y el SHA (que se calcula
+        # con los bytes leidos, no con el archivo en disco) pasaba igual
+        # con un archivo mezclado. Si ya hay una en curso, avisar y no
+        # arrancar otra.
+        try:
+            _acquired = self._ota_install_lock.acquire(blocking=False)
+        except Exception:
+            # FIX v0.1.16: si el candado mismo falla, NO instalar (antes
+            # se seguia como si no hubiera instalacion en curso y dos
+            # descargas podian mezclarse en el mismo .new).
+            _acquired = False
+        if not _acquired:
+            self.show_alert("Ya se está instalando", "Ya hay una actualización en curso. Espera a que termine.")
+            return
+        self._ota_installing = True
         self._ota_close_prompt()
         self.show_alert("Descargando", f"Descargando la versión {info.get('tag')}... La app se cerrará sola al terminar.")
 
         def _work():
             try:
-                self._ota_download_and_install(info)
-            except Exception as e:
                 try:
-                    self.after(0, lambda: self.show_alert("No se pudo actualizar", f"Error al descargar:\n{e}"))
+                    self._ota_download_and_install(info)
+                except Exception as e:
+                    # FIX v0.1.14 (GPT): capturar el texto ahora — la variable
+                    # `e` se borra al salir del except y el lambda viejo
+                    # fallaba con NameError cuando se mostraba el aviso.
+                    error_text = str(e)
+                    try:
+                        self.after(0, lambda message=error_text: self.show_alert(
+                            "No se pudo actualizar", f"Error al actualizar:\n{message}"))
+                    except Exception:
+                        pass
+            finally:
+                # FIX v0.1.15 punto 6: liberar el candado para poder
+                # reintentar tras un fallo (si tuvo exito la app se cierra
+                # igual con el teardown, asi que dejarlo puesto no importa).
+                try:
+                    self._ota_installing = False
+                except Exception:
+                    pass
+                try:
+                    self._ota_install_lock.release()
                 except Exception:
                     pass
         threading.Thread(target=_work, daemon=True).start()
@@ -2658,50 +3861,159 @@ class DualSenseStudioApp(ctk.CTk):
         import subprocess
         exe_path = os.path.abspath(sys.executable)
         new_path = exe_path + ".new"
+        # FIX v0.1.14 (GPT): descargar a un archivo parcial y moverlo a
+        # .new solo cuando este completo y verificado; un .new a medias
+        # nunca debe parecer una descarga terminada.
+        partial_path = new_path + ".download"
         tok = self._ota_token()
-        req = urllib.request.Request(info["asset_url"], headers={
+        headers = {
             "Accept": "application/octet-stream",
             "User-Agent": "DualSenseStudio",
-        })
+        }
+        # FIX v0.1.18 (Claude p3): descargar con el opener que quita
+        # Authorization al cambiar de host (ver _StripAuthRedirectHandler).
+        _opener = urllib.request.build_opener(_StripAuthRedirectHandler())
+        # FIX v0.1.16: defensa en profundidad (por si info llega de
+        # otro lado): solo descargar de api.github.com.
+        from urllib.parse import urlparse as _urlparse_d
+        if _urlparse_d(info["asset_url"]).hostname != "api.github.com":
+            raise RuntimeError("La URL de descarga no es de la API oficial de GitHub.")
+        req = urllib.request.Request(info["asset_url"], headers=headers)
         if tok:
             req.add_header("Authorization", "Bearer " + tok)
-        h = hashlib.sha256()
+        digest = hashlib.sha256()
         total = 0
-        with urllib.request.urlopen(req, timeout=60) as resp, open(new_path, "wb") as out:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                h.update(chunk)
-                total += len(chunk)
-                out.write(chunk)
-        if total < 1000000:
-            raise RuntimeError("Descarga incompleta (archivo demasiado chico).")
-        sha_url = info.get("sha_url")
-        if sha_url:
-            req2 = urllib.request.Request(sha_url, headers={
-                "Accept": "application/octet-stream",
-                "User-Agent": "DualSenseStudio",
-            })
+        try:
+            with _opener.open(req, timeout=90) as response, open(partial_path, "wb") as output:
+                while True:
+                    chunk = response.read(1024 * 256)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    digest.update(chunk)
+                    total += len(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+
+            if total < 10_000_000:
+                raise RuntimeError("Descarga incompleta: el archivo recibido es demasiado pequeño.")
+
+            # FIX v0.1.16 (GPT plan 5): verificar el tamaño contra el
+            # que publica el release (corta descargas truncadas aunque
+            # el servidor no avise).
+            _asset_size = info.get("asset_size")
+            if _asset_size:
+                try:
+                    if int(_asset_size) != total:
+                        raise RuntimeError("La descarga no coincide con el tamaño publicado por el release.")
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
+
+            # FIX v0.1.14 (GPT): un ejecutable PE de Windows debe comenzar
+            # con la firma MZ; FIX v0.1.16: verificar tambien la firma
+            # PE\0\0 en el offset e_lfanew (un archivo con solo 'MZ'
+            # al inicio no es un .exe valido).
+            with open(partial_path, "rb") as downloaded:
+                _head = downloaded.read(512)
+                _is_pe = False
+                if len(_head) >= 64 and _head[:2] == b"MZ":
+                    _lfanew = int.from_bytes(_head[0x3C:0x40], "little")
+                    if 0 < _lfanew < len(_head) - 4 and _head[_lfanew:_lfanew + 4] == b"PE\x00\x00":
+                        _is_pe = True
+                if not _is_pe:
+                    raise RuntimeError("El archivo descargado no es un ejecutable Windows válido.")
+
+            # FIX v0.1.15: sin hash publicado no hay verificación posible;
+            # fallar en vez de instalar sin verificar.
+            sha_url = info.get("sha_url")
+            if not sha_url:
+                raise RuntimeError("La actualización no publicó su hash SHA-256; no se puede verificar la descarga.")
+            # NOTA v0.1.16 (GPT plan 5, honestidad): el SHA prueba que
+            # la descarga es EXACTAMENTE lo que publico el release, no
+            # que el release sea autentico: un release comprometido
+            # publicaria su propio .sha256 a juego. La autenticidad hoy
+            # descansa en la cuenta de GitHub + HTTPS; el .exe NO esta
+            # firmado con Authenticode (no hay certificado), asi que no
+            # se puede verificar firma. Eso queda como trabajo futuro
+            # si se compra un certificado de firma de codigo.
+            sha_req = urllib.request.Request(sha_url, headers=headers)
             if tok:
-                req2.add_header("Authorization", "Bearer " + tok)
-            with urllib.request.urlopen(req2, timeout=15) as resp:
-                expected = resp.read().decode("utf-8", "ignore").split()[0].strip().lower()
-            if expected and h.hexdigest() != expected:
-                raise RuntimeError("La descarga no pasó la verificación (hash distinto).")
+                sha_req.add_header("Authorization", "Bearer " + tok)
+            with _opener.open(sha_req, timeout=20) as response:
+                expected_text = response.read(4096).decode("utf-8", "ignore").strip()
+            match = re.search(r"\b([a-fA-F0-9]{64})\b", expected_text)
+            if not match:
+                raise RuntimeError("No se pudo interpretar el SHA-256 publicado por la actualización.")
+            if digest.hexdigest().lower() != match.group(1).lower():
+                raise RuntimeError("La descarga no pasó la verificación SHA-256.")
+
+            # El updater solo verá .new cuando la descarga ya esté completa.
+            try:
+                if os.path.exists(new_path):
+                    os.remove(new_path)
+            except OSError:
+                pass
+            os.replace(partial_path, new_path)
+        except Exception:
+            for temporary in (partial_path, new_path):
+                try:
+                    if os.path.exists(temporary):
+                        os.remove(temporary)
+                except OSError:
+                    pass
+            raise
         bat_path = os.path.join(BASE_DIR, "actualizar_dualsense.bat")
         with open(bat_path, "w", encoding="utf-8") as f:
-            f.write(_ota_updater_script(exe_path, new_path, os.path.basename(exe_path)))
+            f.write(_ota_updater_script(exe_path, new_path, os.path.basename(exe_path),
+                                        exe_path + ".bak"))
+        # FIX v0.1.12: lanzar con ventana oculta (CREATE_NO_WINDOW, no
+        # DETACHED_PROCESS: sin consola el `timeout` del .bat fallaba) y
+        # guardar la salida del actualizador en actualizar_log.txt para
+        # poder diagnosticar si vuelve a fallar.
+        _log_path = os.path.join(BASE_DIR, "actualizar_log.txt")
         try:
-            subprocess.Popen(["cmd", "/c", bat_path],
-                             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+            _log_f = open(_log_path, "wb")
+            try:
+                subprocess.Popen(["cmd", "/c", bat_path], stdout=_log_f,
+                                 stderr=subprocess.STDOUT,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            finally:
+                _log_f.close()
         except Exception:
             subprocess.Popen(["cmd", "/c", bat_path])
-        self.after(0, lambda: self.quit_app())
+        self.after(0, self._ota_teardown_and_quit)
+
+    def _ota_teardown_and_quit(self):
+        """FIX v0.1.12 (OTA): antes de cerrar para actualizar, desmontar
+        el servicio limpio (unir el worker, destruir el pad virtual) y
+        luego salir. (Desde M23, quit_app ya desmonta solo; este
+        stop_service explícito queda como cinturón y tirantes: si el
+        de quit_app fallara, el servicio ya estaría parado.)"""
+        try:
+            self.stop_service()
+        except Exception:
+            pass
+        try:
+            self.quit_app()
+        except Exception:
+            pass
 
     def _open_settings_dialog(self):
         """Sección Ajustes: copias de seguridad y restauración. Mismo
         lenguaje visual que el diálogo de renombrar (sin grab, topmost)."""
+        # FIX v0.1.15 punto 14: si ya hay un diálogo abierto, traerlo al
+        # frente en vez de crear otro (el viejo quedaba huérfano y solo el
+        # último recibía las actualizaciones de OTA).
+        try:
+            _dlg = getattr(self, "_settings_dialog", None)
+            if _dlg is not None and _dlg.winfo_exists():
+                _dlg.lift()
+                _dlg.focus_set()
+                return
+        except Exception:
+            pass
         dialog = ctk.CTkToplevel(self)
         dialog.title("Ajustes")
         dialog.geometry("400x380")
@@ -2873,11 +4185,6 @@ class DualSenseStudioApp(ctk.CTk):
                       command=_reset).pack(side="left", padx=8)
         ctk.CTkButton(btn_row, text="Cerrar", width=130, fg_color="#3b82f6",
                       command=dialog.destroy).pack(side="left", padx=8)
-
-    def remove_game(self, exe):
-        # Compat con llamadas viejas
-        self._selected_game_exe = exe
-        self.remove_selected_game()
 
     def browse_game_exe(self):
         """Botón ＋ estilo OBS: buscar el .exe del juego manualmente (o acceso directo de Steam .url)."""
@@ -3389,8 +4696,8 @@ class DualSenseStudioApp(ctk.CTk):
                     win32gui.SetForegroundWindow(game_hwnd)
                     if _log_base:
                         try:
-                            with open(os.path.join(_log_base, "restore_log.txt"), "a", encoding="utf-8") as _f:
-                                _f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} FAST exe={exe_path} hwnd={game_hwnd}\n")
+                            _append_log_capped(os.path.join(_log_base, "restore_log.txt"),
+                                               f"{time.strftime('%Y-%m-%d %H:%M:%S')} FAST exe={exe_path} hwnd={game_hwnd}\n")
                         except Exception:
                             pass
                     return
@@ -3402,8 +4709,8 @@ class DualSenseStudioApp(ctk.CTk):
         if game_hwnd:
             if _log_base:
                 try:
-                    with open(os.path.join(_log_base, "restore_log.txt"), "a", encoding="utf-8") as _f:
-                        _f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} SKIP-FALLBACK exe={exe_path} hwnd={game_hwnd}\n")
+                    _append_log_capped(os.path.join(_log_base, "restore_log.txt"),
+                                       f"{time.strftime('%Y-%m-%d %H:%M:%S')} SKIP-FALLBACK exe={exe_path} hwnd={game_hwnd}\n")
                 except Exception:
                     pass
             return
@@ -3674,8 +4981,10 @@ class DualSenseStudioApp(ctk.CTk):
 
     def _check_game_detection(self):
         """Máquina de estados de juegos (tick cada 1s):
-        Detección por PROCESO (el .exe activo manda, no el foco) o por ventana
-        al frente. El perfil se aplica al detectar; el recuadro de confirmación
+        Detección por ventana al frente: solo el exe al frente, y solo si
+        está mapeado (FIX v0.1.15 punto 10; antes el tick tomaba el primer
+        juego mapeado corriendo aunque fuera en segundo plano). El perfil
+        se aplica al detectar; el recuadro de confirmación
         abre 15s después para no aparecer sobre Javelin/launcher.
         - VIGILANCIA: ningún juego aplicado; espera a que un juego mapeado esté activo.
         - APLICADO: el juego mapeado tiene su perfil puesto; no se suelta por
@@ -3686,22 +4995,17 @@ class DualSenseStudioApp(ctk.CTk):
         Revertir usa tiempo real (timestamp), no conteo de ticks, para que sean 10s de verdad.
         Si el usuario cambió el perfil a mano, el revertir no lo pisa (respeta el manual)."""
         exe_lower, _ = self.get_foreground_exe()
-        # Detección por PROCESO (Pedro: el .exe activo manda, no el foco):
-        # un juego mapeado que está corriendo se detecta aunque otra ventana
-        # tenga el foco (al abrir, Javelin/launcher se quedan con el foco y
-        # el juego en pantalla completa no lo recibe hasta el clic). Una sola
-        # pasada de procesos por tick. También cubre el RELEVO launcher→juego:
-        # si el aplicado murió pero otro mapeado vive, se cambia a ese sin
-        # soltar el perfil (el hueco de ~1s entre ambos no revierte nada).
+        # FIX v0.1.15 punto 10: solo el exe AL FRENTE manda, y solo si
+        # esta mapeado (Pedro: si no esta en la lista, no se hace nada).
+        # Antes, si no habia nada aplicado, el tick tomaba el PRIMER
+        # juego mapeado que estuviera corriendo (aunque fuera en segundo
+        # plano) y lo ponia como si estuviera al frente, con el contador
+        # ya en 2: te aplicaba el perfil del juego de atras (p. ej. BF6)
+        # mientras jugabas otro (p. ej. FC 27). El perfil aplicado sigue
+        # sin soltarse mientras su proceso viva (rama else de abajo):
+        # eso no cambia.
         _names = self._running_process_names()
         self._last_seen_process_names = _names
-        if not self._last_auto_game or self._last_auto_game not in _names:
-            for _exe in self.game_profiles:
-                if _exe in _names:
-                    exe_lower = _exe
-                    self._detect_game_streak = _exe
-                    self._detect_game_count = 2
-                    break
         if exe_lower and exe_lower in self.game_profiles:
             # Juego mapeado al frente: presente de nuevo, se cancela cualquier ausencia.
             self._absence_since = None
@@ -3766,12 +5070,10 @@ class DualSenseStudioApp(ctk.CTk):
             # proceso del juego murió o si la ausencia llega a 10s.
             _sess = getattr(self, "_popup_session_exe", None)
             if _sess:
-                _gone = False
-                try:
-                    _gone = not any((p.info.get("name") or "").lower() == _sess
-                                    for p in psutil.process_iter(["name"]))
-                except Exception:
-                    _gone = False
+                # FIX v0.1.15 M22: reutilizar la enumeración del tick
+                # (_names, ya calculada arriba) en vez de listar todos
+                # los procesos otra vez para ver si el juego se cerró.
+                _gone = _sess not in _names
                 if _gone:
                     self._end_popup_session()
                 else:
@@ -3833,16 +5135,58 @@ class DualSenseStudioApp(ctk.CTk):
             cloak_on = True
         else:
             return  # legado: no tocar la postura
+        # FIX v0.1.16 (GPT plan 4): la postura usa el MISMO ciclo que
+        # el boton manual (stop -> aplicar -> start), no un atajo
+        # directo: el atajo dejaba estados residuales (virtual viejo
+        # vivo, cloak a medias). Via rapida: si la postura deseada es
+        # la actual, no se rearma nada (los cambios entre perfiles
+        # iguales siguen siendo instantaneos).
+        try:
+            _cur_emu = self.emu_selector.get()
+        except Exception:
+            _cur_emu = None
+        try:
+            _cur_cloak = bool(self.hidhide_switch.get())
+        except Exception:
+            _cur_cloak = None
         self.emu_selector.set(emu)
-        if self.running_thread:
-            self.setup_virtual_controller(emu)
         if cloak_on:
             self.hidhide_switch.select()
-            if self.hw.connected:
-                self._enable_cloak()
         else:
             self.hidhide_switch.deselect()
-            self.hidcloak.disable()
+        if not self.running_thread:
+            # Sin servicio: solo queda guardada la postura; el cloak se
+            # aplica cuando arranque el servicio (start_service lee el
+            # switch). Si el mando esta conectado pero el servicio no
+            # corre, aplicar el cloak ya mismo como antes.
+            if cloak_on and self.hw.connected:
+                self._enable_cloak()
+            elif not cloak_on:
+                self.hidcloak.disable()
+            return
+        if emu == _cur_emu and cloak_on == _cur_cloak:
+            return
+        if not self.stop_service():
+            # Igual que el toggle: si la limpieza del cloak no quedo
+            # confirmada, revertir postura y no reiniciar sobre un
+            # cloak a medias.
+            try:
+                self.emu_selector.set(_cur_emu if _cur_emu else emu)
+            except Exception:
+                pass
+            try:
+                if _cur_cloak:
+                    self.hidhide_switch.select()
+                else:
+                    self.hidhide_switch.deselect()
+            except Exception:
+                pass
+            self.show_alert("Anti Doble-Input",
+                            "La limpieza anterior no quedó confirmada. "
+                            "No se cambió el perfil.\n\n"
+                            "Revisa debug_hid.log y vuelve a intentarlo.")
+            return
+        self.start_service()
 
     def load_profile_to_ui(self, profile_name, apply_posture=True):
         self._loading_profile = True
@@ -4094,7 +5438,9 @@ class DualSenseStudioApp(ctk.CTk):
         if name in self.profiles:
             self.show_alert("Ya existe", f"Ya hay un perfil llamado '{name}'.")
             return
-        self.profiles[name] = self.collect_ui_state()
+        _st = self.collect_ui_state()
+        _st.pop("lightbar", None)
+        self.profiles[name] = _st
         self.save_profiles_to_disk()
         self.profile_combo.configure(values=list(self.profiles.keys()))
         self.profile_combo.set(name)
@@ -4123,46 +5469,75 @@ class DualSenseStudioApp(ctk.CTk):
         # tiempo; es no-determinista, por eso unas veces si y otras no.
         # Ahora: se desregistra el callback, se suelta la referencia y
         # se fuerza gc.collect() para que __del__ corra en el acto.
-        _pad = self.virtual_pad
-        self.virtual_pad = None
-        if _pad is None:
+        # FIX v0.1.15 (GPT): bajo el lock del pad, para no destruirlo
+        # mientras el worker hace update() en el mismo pad.
+        lock = getattr(self, "_pad_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._pad_lock = lock
+        # FIX v0.1.16 (GPT plan 2): el lock sin timeout podia esperar
+        # para siempre si el worker se quedo colgado dentro de un
+        # update() de ViGEm. Con 2 s, si el worker no suelta, se deja
+        # el pad para el proximo intento (el worker guarda su propia
+        # referencia local, asi que no se libera debajo de el).
+        _acquired = lock.acquire(timeout=2.0)
+        if not _acquired:
+            self._debug_log_write("PAD DESTROY: lock ocupado >2 s (worker colgado en ViGEm); se deja el pad para el próximo intento")
             return
         try:
-            _pad.unregister_notification()
-        except Exception:
-            pass
-        try:
-            del _pad
-            gc.collect()
-        except Exception:
-            pass
+            _pad = self.virtual_pad
+            self.virtual_pad = None
+            if _pad is None:
+                return
+            try:
+                _pad.unregister_notification()
+            except Exception:
+                pass
+            try:
+                del _pad
+                gc.collect()
+            except Exception:
+                pass
+        finally:
+            lock.release()
 
     def setup_virtual_controller(self, mode_str):
-        # FIX 4: sin ViGEmBus no crashea; avisa y cae a Solo Triggers
-        self._destroy_virtual_pad()
-        self.rumble_large = 0
-        self.rumble_small = 0
-        try:
-            if mode_str == "Xbox 360 (XInput)":
-                self.virtual_pad = vg.VX360Gamepad()
-                self.emulation_type = "X360"
-            elif mode_str == "DualShock 4 (PS4)":
-                self.virtual_pad = vg.VDS4Gamepad()
-                self.emulation_type = "DS4"
-            else:
+        # FIX v0.1.15 (GPT): mismo lock que el worker y el destroy.
+        with self._pad_lock:
+            # FIX 4: sin ViGEmBus no crashea; avisa y cae a Solo Triggers
+            self._destroy_virtual_pad()
+            self.rumble_large = 0
+            self.rumble_small = 0
+            try:
+                if mode_str == "Xbox 360 (XInput)":
+                    self.virtual_pad = vg.VX360Gamepad()
+                    self.emulation_type = "X360"
+                elif mode_str == "DualShock 4 (PS4)":
+                    self.virtual_pad = vg.VDS4Gamepad()
+                    self.emulation_type = "DS4"
+                else:
+                    self.emulation_type = "NONE"
+                    return
+                # FIX 5: rumble real via notificacion (0-255, sin divisiones raras)
+                self.virtual_pad.register_notification(callback_function=self._on_rumble)
+            except Exception as e:
+                # FIX v0.1.16 (GPT plan 2): si el pad se creo pero fallo
+                # el register_notification, quedaba un virtual a medias
+                # vivo en Steam sin callback de rumble mientras la app
+                # creia estar en Solo Triggers. Destruirlo antes de caer.
+                try:
+                    self._destroy_virtual_pad()
+                except Exception:
+                    pass
+                self.virtual_pad = None
                 self.emulation_type = "NONE"
-                return
-            # FIX 5: rumble real via notificacion (0-255, sin divisiones raras)
-            self.virtual_pad.register_notification(callback_function=self._on_rumble)
-        except Exception as e:
-            self.emulation_type = "NONE"
-            self.emu_selector.set("Solo Triggers (Sin Emular)")
-            self.show_alert("Falta ViGEmBus",
-                            "No se pudo crear el control virtual.\n\n"
-                            "Instala el driver ViGEmBus:\n"
-                            f"{VIGEMBUS_URL}\n\n"
-                            f"Detalle: {e}\n\n"
-                            "Mientras tanto: modo Solo Triggers.")
+                self.emu_selector.set("Solo Triggers (Sin Emular)")
+                self.show_alert("Falta ViGEmBus",
+                                "No se pudo crear el control virtual.\n\n"
+                                "Instala el driver ViGEmBus:\n"
+                                f"{VIGEMBUS_URL}\n\n"
+                                f"Detalle: {e}\n\n"
+                                "Mientras tanto: modo Solo Triggers.")
 
     def apply_triggers_to_hardware(self):
         if not self.hw.connected:
@@ -4186,22 +5561,85 @@ class DualSenseStudioApp(ctk.CTk):
                           st["r2_mode"], st["r2_start"], st["r2_end"], st["r2_force"],
                           tuple(st["lightbar"]), self.rumble_small, self.rumble_large)
 
+    def _check_startup_cleanup_legacy(self):
+        """FIX v0.1.16 (GPT plan 1): prompt UNICO por entradas Sony
+        ajenas en la blacklist (restos de versiones sin journal o
+        escondidas a mano). Si el usuario dice que si, se quitan; si
+        dice que no, se dejan y no se vuelve a preguntar (queda
+        guardado en el journal)."""
+        try:
+            _hc = getattr(self, "hidcloak", None)
+            if _hc is None:
+                return
+            if not _hc._startup_cleanup_done.is_set():
+                self.after(10000, self._check_startup_cleanup_legacy)
+                return
+            _unknown = list(getattr(_hc, "_startup_unknown_sony", []) or [])
+            if not _unknown:
+                return
+            if getattr(_hc, "_legacy_prompted", False):
+                return
+            _hc._legacy_prompted = True
+            try:
+                _hc._save_owned_state()
+            except Exception:
+                pass
+            try:
+                import tkinter.messagebox as _mb
+                _yes = _mb.askyesno(
+                    "Mando Sony oculto",
+                    "Al arrancar encontré un mando Sony oculto en HidHide "
+                    "que esta app NO registró (puede ser un resto de una "
+                    "versión vieja o que lo escondiste a mano).\n\n"
+                    f"Entradas: {', '.join(_unknown)}\n\n"
+                    "¿Quieres quitarlas de la lista de ocultos para que "
+                    "el mando vuelva a verse?",
+                    parent=self)
+            except Exception:
+                return
+            if not _yes:
+                return
+            try:
+                ok, cur = _hc._get_blacklist_detailed()
+                if ok:
+                    _keep = [p for p in cur if p not in _unknown]
+                    if _hc.set_blacklist(_keep):
+                        _hc._cloak_debug("LEGACY: entradas ajenas quitadas por el usuario")
+                        try:
+                            _hc._startup_unknown_sony = []
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def toggle_service(self):
         if self.running_thread:
+            # Desconexión manual: el monitor no debe reconectar solo.
+            self._manual_disconnect = True
             self.stop_service()
         else:
+            self._manual_disconnect = False
             self.start_service()
 
     def start_service(self):
+        # FIX v0.1.16 (GPT plan 2): guardia propia contra workers
+        # duplicados: si ya hay un worker vivo, no arrancar otro (antes
+        # solo los llamadores lo evitaban, no la funcion misma).
+        _wt0 = getattr(self, "_worker_thread", None)
+        if _wt0 is not None and _wt0.is_alive():
+            return
         if self.hw.connect():
             self.setup_virtual_controller(self.emu_selector.get())
             self.running_thread = True
+            self._service_gen += 1  # FIX v0.1.15 punto 18: nueva generación.
             # Anti doble-input: cloak en HidHide (disable() restaura tu config al salir)
             if self.hidhide_switch.get():
                 self._enable_cloak()
             self.apply_triggers_to_hardware()
 
-            _wt = threading.Thread(target=self.worker_loop, daemon=True)
+            _wt = threading.Thread(target=self._worker_loop_guarded, daemon=True)
             self._worker_thread = _wt
             _wt.start()
 
@@ -4213,27 +5651,53 @@ class DualSenseStudioApp(ctk.CTk):
 
     def stop_service(self):
         self.running_thread = False
+        self._service_gen += 1  # FIX v0.1.15 punto 18: nueva generación.
         # FIX v0.1.10: esperar a que el hilo worker muera de verdad
         # (con timeout, nunca bloquear la UI). El worker guarda el pad
         # virtual en su variable local `pad` durante cada frame: si el
         # restart arranca antes de que ese hilo suelte el pad, el
         # virtual viejo sigue vivo en Steam aunque virtual_pad sea None.
+        # FIX v0.1.15 (GPT): esperar 3 s (no 1 s) a que el worker
+        # muera de verdad antes de liberar HID/ViGEm; con el lock del
+        # pad ya no hay carrera al destruir, así que se sigue igual
+        # aunque el hilo siga vivo (queda registrado).
         try:
             _wt = getattr(self, "_worker_thread", None)
             if _wt is not None and _wt.is_alive() and threading.current_thread() is not _wt:
-                _wt.join(timeout=1.0)
+                _wt.join(timeout=3.0)
+                if _wt.is_alive():
+                    self._debug_log_write("STOP: worker no terminó en 3 s; se sigue con el desmontaje (el lock del pad lo protege)")
         except Exception:
             pass
-        self.hidcloak.disable()  # limpia el cloak y restaura tu config previa
+        self._worker_thread = None
+        # FIX v0.1.15 (GPT, adaptado): stop_service informa si la
+        # limpieza del cloak quedó confirmada, para que el toggle no
+        # reinicie el servicio sobre un cloak a medias. A diferencia
+        # del archivo de GPT, NO se aborta el desmontaje si el worker
+        # sigue vivo (arriba ya se esperó 3 s y el lock del pad lo
+        # protege) ni si disable() falla: el resto (cerrar el físico,
+        # destruir el virtual) corre igual y el journal conserva la
+        # propiedad para reintentarlo en el próximo arranque.
+        _cloak_ok = False
+        try:
+            _cloak_ok, _cloak_msg = self.hidcloak.disable()
+            if not _cloak_ok:
+                self._debug_log_write(f"STOP CLOAK: {_cloak_msg}")
+        except Exception as exc:
+            self._debug_log_write(f"STOP CLOAK: {exc!r}")
         self.hw.close()
         self._destroy_virtual_pad()
         self.rumble_large = 0
         self.rumble_small = 0
         self._last_sig = None
-        self.status_label.configure(text="● Desconectado", text_color="#f87171")
-        self.connect_btn.configure(text="Conectar Mando", fg_color="#3b82f6", hover_color="#2563eb")
-        self.batt_label.configure(text="")
-        self._last_batt_txt = ""
+        try:
+            self.status_label.configure(text="● Desconectado", text_color="#f87171")
+            self.connect_btn.configure(text="Conectar Mando", fg_color="#3b82f6", hover_color="#2563eb")
+            self.batt_label.configure(text="")
+            self._last_batt_txt = ""
+        except Exception:
+            pass
+        return _cloak_ok
 
     @staticmethod
     def process_axis(raw_byte, deadzone_pct, curve_exp, invert=False):
@@ -4270,6 +5734,35 @@ class DualSenseStudioApp(ctk.CTk):
             ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             ctypes.windll.user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
         self.last_touch_btn = st["touch_btn"]
+
+    def _worker_loop_guarded(self):
+        """FIX v0.1.15 punto 7: guarda del hilo worker. Si worker_loop
+        muere por una excepcion, el hilo es daemon y el exe no tiene
+        consola, asi que el error no se veia en ningun lado y la app
+        seguia diciendo 'Conectado' con el pad muerto. La guarda deja
+        el error completo en debug_hid.log (sin depender del interruptor
+        de log) y dispara la ruta de mando perdido, para que el monitor
+        reconecte solo."""
+        try:
+            self.worker_loop()
+        except Exception:
+            try:
+                import traceback
+                _append_log_capped(os.path.join(BASE_DIR, "debug_hid.log"),
+                                   f"{time.strftime('%H:%M:%S')} WORKER DIED:\n{traceback.format_exc()}")
+            except Exception:
+                pass
+            # Solo recuperar si el servicio seguia activo: si fue un
+            # stop_service normal, el loop salio por el while, no por aqui.
+            if getattr(self, "running_thread", False):
+                try:
+                    self.hw.connected = False
+                except Exception:
+                    pass
+                try:
+                    self.after(0, lambda _gen=getattr(self, "_service_gen", 0): self._on_device_lost(_gen))
+                except Exception:
+                    pass
 
     def worker_loop(self):
         # FIX 6: lee input rapido, pero escribe al HID solo si algo cambio
@@ -4424,323 +5917,329 @@ class DualSenseStudioApp(ctk.CTk):
                 batt_txt = self._batt_text(st)
                 if batt_txt != self._last_batt_txt:
                     self._last_batt_txt = batt_txt
-                    try:
-                        self.batt_label.configure(text=batt_txt)
-                    except Exception:
-                        pass
-                dz_l = self.dz_l_slider.get()
-                dz_r = self.dz_r_slider.get()
-                curve = self.curve_slider.get()
+                    # La etiqueta la actualiza el hilo principal (foto UI).
+                    self._ui_batt_pending = batt_txt
+                _snap = self._ui_snap or {}
+                dz_l = _snap.get("deadzone_l", 0)
+                dz_r = _snap.get("deadzone_r", 0)
+                curve = _snap.get("curve", 1.0)
 
                 lx_f = self.process_axis(st["LX"], dz_l, curve, invert=False)
                 ly_f = self.process_axis(st["LY"], dz_l, curve, invert=True)
                 rx_f = self.process_axis(st["RX"], dz_r, curve, invert=False)
                 ry_f = self.process_axis(st["RY"], dz_r, curve, invert=True)
 
-                if self.touch_switch.get():
-                    self.handle_touchpad_mouse(st, self.sens_slider.get())
+                if _snap.get("touch_on", False):
+                    self.handle_touchpad_mouse(st, _snap.get("mouse_sens", 1.0))
 
-                pad = self.virtual_pad
+                with self._pad_lock:
+                    pad = self.virtual_pad
 
-                if pad and self.emulation_type == "X360":
-                    pad.reset()
-                    if st["cross"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_A)
-                    if st["circle"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
-                    if st["square"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
-                    if st["triangle"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
-                    if st["L1"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER)
-                    if st["R1"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
-                    if st["L3"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_THUMB)
-                    if st["R3"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_THUMB)
-                    if st["share"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_BACK)
-                    if st["options"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_START)
-                    if st["ps"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_GUIDE)
-                    if st["up"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP)
-                    if st["down"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN)
-                    if st["left"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT)
-                    if st["right"]:
-                        pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT)
+                    if pad and self.emulation_type == "X360":
+                        pad.reset()
+                        if st["cross"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_A)
+                        if st["circle"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
+                        if st["square"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
+                        if st["triangle"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
+                        if st["L1"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER)
+                        if st["R1"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
+                        if st["L3"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_THUMB)
+                        if st["R3"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_THUMB)
+                        if st["share"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_BACK)
+                        if st["options"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_START)
+                        if st["ps"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_GUIDE)
+                        if st["up"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP)
+                        if st["down"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN)
+                        if st["left"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT)
+                        if st["right"]:
+                            pad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT)
 
-                    pad.left_trigger(value=st["L2"])
-                    pad.right_trigger(value=st["R2"])
-                    pad.left_joystick(x_value=int(lx_f * 32767), y_value=int(ly_f * 32767))
-                    pad.right_joystick(x_value=int(rx_f * 32767), y_value=int(ry_f * 32767))
-                    pad.update()
-
-                elif pad and self.emulation_type == "DS4":
-                    pad.reset()
-                    if st["cross"]:
-                        pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_CROSS)
-                    if st["circle"]:
-                        pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_CIRCLE)
-                    if st["square"]:
-                        pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_SQUARE)
-                    if st["triangle"]:
-                        pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_TRIANGLE)
-                    if st["L1"]:
-                        pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_SHOULDER_LEFT)
-                    if st["R1"]:
-                        pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_SHOULDER_RIGHT)
-                    if st["share"]:
-                        pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_SHARE)
-                    if st["options"]:
-                        pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_OPTIONS)
-                    if st["L3"]:
-                        pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_THUMB_LEFT)
-                    if st["R3"]:
-                        pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_THUMB_RIGHT)
-                    if st["ps"]:
-                        pad.press_special_button(vg.DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_PS)
-                    # Touchpad: clic pass-through al juego solo si el modo
-                    # ratón está apagado (si está encendido, el touchpad
-                    # mueve el cursor, comportamiento elegido por el usuario).
-                    # En modo X360 no hay touchpad que pasar (el mando Xbox
-                    # no tiene); la posición del dedo no la expone vgamepad
-                    # (solo el clic), así que solo va el clic.
-                    if st["touch_btn"] and not self.touch_switch.get():
-                        pad.press_special_button(vg.DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_TOUCHPAD)
-                    # D-pad (hat): combinar las 4 direcciones (con diagonales).
-                    _up, _down, _left, _right = st["up"], st["down"], st["left"], st["right"]
-                    if _up and _right:
-                        pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTHEAST)
-                    elif _right and _down:
-                        pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_SOUTHEAST)
-                    elif _down and _left:
-                        pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_SOUTHWEST)
-                    elif _left and _up:
-                        pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTHWEST)
-                    elif _up:
-                        pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTH)
-                    elif _right:
-                        pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_EAST)
-                    elif _down:
-                        pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_SOUTH)
-                    elif _left:
-                        pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_WEST)
-                    else:
-                        pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NONE)
-
-                    pad.left_trigger(value=st["L2"])
-                    pad.right_trigger(value=st["R2"])
-                    pad.left_joystick(x_value=int((lx_f + 1.0) * 127.5), y_value=int((-ly_f + 1.0) * 127.5))
-                    pad.right_joystick(x_value=int((rx_f + 1.0) * 127.5), y_value=int((-ry_f + 1.0) * 127.5))
-                    # Touchpad: pass-through de POSICIÓN vía reporte extendido
-                    # DS4 (vgamepad no expone posición; solo el clic). Si algo
-                    # falla, se cae al update() normal (sin posición, pero con
-                    # todo el input intacto). Solo modo DS4; en X360 no hay
-                    # touchpad que pasar.
-                    _sent_ex = False
-                    _vcom = getattr(self, "_vcom", None)
-                    if _vcom is not False:
-                        try:
-                            if _vcom is None:
-                                from vgamepad.win import vigem_commons as _vcom
-                                self._vcom = _vcom
-                            # vgamepad 0.1.0: c_byte ES c_ubyte (SIN signo,
-                            # verificado en el fuente del tag v0.1.0).
-                            # El _sb viejo restaba 256 y mandaba valores
-                            # negativos a campos unsigned: ctypes lo
-                            # rechazaba, el bloque entero fallaba en
-                            # silencio y el reporte extendido NUNCA se
-                            # enviaba (por eso la bateria nunca llegaba
-                            # a Steam y quedaba en 5%, y el touchpad
-                            # tampoco pasaba). Bytes crudos 0-255.
-                            _sb = lambda v: v & 0xFF
-                            _ex = _vcom.DS4_REPORT_EX()
-                            _r = _ex.Report
-                            _r.bThumbLX = pad.report.bThumbLX
-                            _r.bThumbLY = pad.report.bThumbLY
-                            _r.bThumbRX = pad.report.bThumbRX
-                            _r.bThumbRY = pad.report.bThumbRY
-                            _r.wButtons = pad.report.wButtons
-                            _r.bSpecial = pad.report.bSpecial
-                            _r.bTriggerL = pad.report.bTriggerL
-                            _r.bTriggerR = pad.report.bTriggerR
-                            # BATERIA (FIX v0.1.8, 2026-11-10): Steam/SDL NO
-                            # lee la bateria de bBatteryLvl (byte 12), sino
-                            # de bBatteryLvlSpecial (byte 30, nibble 0-10,
-                            # bit 0x10 = cargando). Por eso Steam mostraba
-                            # siempre 5% (= 0*10+5): ese byte quedaba en 0.
-                            # DS4Windows solo escribe bBatteryLvlSpecial.
-                            # Se escribe el nibble en AMBOS campos.
-                            _bn = st.get("batt_nibble")
-                            if _bn is not None:
-                                _bn = max(0, min(10, int(_bn)))
-                                _r.bBatteryLvl = _bn
-                                _r.bBatteryLvlSpecial = _bn
-                                if st.get("batt_charging"):
-                                    _r.bBatteryLvl |= 0x10
-                                    _r.bBatteryLvlSpecial |= 0x10
-                            _touching = bool(st["touch_active"]) and not self.touch_switch.get()
-                            _was = getattr(self, "_ex_touch_prev_active", False)
-                            if _touching and not _was:
-                                self._ex_touch_id = (getattr(self, "_ex_touch_id", 0) + 1) & 0x7F
-                                self._ex_down_t = time.time()
-                                self._ex_traj = []
-                                self._ex_traj_clicked = False
-                            if _touching:
-                                _rx = max(0, min(1919, int(st["touch_x"])))
-                                # Reescala Y: el DualSense reporta 0-1079 y la
-                                # superficie DS4 es 0-941. Sin reescala, la
-                                # vertical salia ~15% caliente y el clamp en
-                                # 943 dejaba pasar valores fuera de rango.
-                                _ry = max(0, min(941, int(round(int(st["touch_y"]) * 941 / 1079))))
-                                if not _was:
-                                    self._ex_down_x, self._ex_down_y = _rx, _ry
-                                # Sin zona muerta: congelar en el punto de
-                                # apoyo y soltar de golpe crea los saltos que
-                                # el juego leia como gestos.
-                                _tx, _ty = _rx, _ry
-                                self._ex_last_x, self._ex_last_y = _tx, _ty
-                                if st.get("touch_btn"):
-                                    self._ex_traj_clicked = True
-                                _traj = getattr(self, "_ex_traj", None)
-                                if _traj is not None and len(_traj) < 5000:
-                                    _traj.append((int((time.time() - getattr(self, "_ex_down_t", time.time())) * 1000), _rx, _ry, _tx, _ty))
-                            else:
-                                _tx = getattr(self, "_ex_last_x", 0)
-                                _ty = getattr(self, "_ex_last_y", 0)
-                            # FIX v0.1.8 (2026-11-10): el contador de paquetes
-                            # del touch AVANZA EN CADA FRAME, tocando o no,
-                            # como el contador del hardware que DS4Windows
-                            # reenvia tal cual. Congelarlo en reposo (0.1.7)
-                            # era la unica diferencia que quedaba con la
-                            # referencia, y Steam ignoraba los paquetes con
-                            # el contador repetido, asi que nunca veia el
-                            # flag up y el punto se quedaba pegado.
-                            _tid = getattr(self, "_ex_touch_id", 0) & 0x7F
-                            _cur = _r.sCurrentTouch
-                            self._ex_touch_counter = (getattr(self, "_ex_touch_counter", 0) + 1) & 0xFF
-                            _cur.bPacketCounter = _sb(self._ex_touch_counter)
-                            if _touching:
-                                _cur.bIsUpTrackingNum1 = _sb(_tid)
-                                _cur.bTouchData1[0] = _sb(_tx & 0xFF)
-                                _cur.bTouchData1[1] = _sb(((_tx >> 8) & 0x0F) | ((_ty & 0x0F) << 4))
-                                _cur.bTouchData1[2] = _sb((_ty >> 4) & 0xFF)
-                                _r.bTouchPacketsN = 1
-                            else:
-                                _cur.bIsUpTrackingNum1 = _sb(_tid | 0x80)
-                                _cur.bTouchData1[0] = _sb(_tx & 0xFF)
-                                _cur.bTouchData1[1] = _sb(((_tx >> 8) & 0x0F) | ((_ty & 0x0F) << 4))
-                                _cur.bTouchData1[2] = _sb((_ty >> 4) & 0xFF)
-                                _r.bTouchPacketsN = 1
-                            _cur.bIsUpTrackingNum2 = _sb(0x80)
-                            _cur.bTouchData2[0] = 0
-                            _cur.bTouchData2[1] = 0
-                            _cur.bTouchData2[2] = 0
-                            # Previous: patron "sin uso" siempre (con N=1 no
-                            # hay historia real; ceros serian un toque DOWN
-                            # en (0,0) con ID 0).
-                            for _p in (_r.sPreviousTouch[0], _r.sPreviousTouch[1]):
-                                _p.bPacketCounter = 0
-                                _p.bIsUpTrackingNum1 = _sb(0x80)
-                                _p.bTouchData1[0] = 0
-                                _p.bTouchData1[1] = 0
-                                _p.bTouchData1[2] = 0
-                                _p.bIsUpTrackingNum2 = _sb(0x80)
-                                _p.bTouchData2[0] = 0
-                                _p.bTouchData2[1] = 0
-                                _p.bTouchData2[2] = 0
-                            self._ex_touch_prev_active = _touching
-                            # FIX v0.1.9 (2026-11-10) — RAIZ DE TODO: vgamepad
-                            # 0.1.0 define DS4_REPORT_EX con alineacion por
-                            # defecto (72 bytes, DS4_TOUCH de 12 bytes), pero
-                            # ViGEm (pshpack1.h en Common.h) lo define
-                            # EMPAQUETADO (63 bytes, DS4_TOUCH de 9). El
-                            # cliente ViGEm copia 63 bytes del buffer y el
-                            # driver los lee como empaquetado, asi que todos
-                            # los campos desde el timestamp quedaban corridos
-                            # un byte o mas. Eso explica TODO lo visto: la
-                            # bateria siempre 5% (el byte 30 leia un 0), el
-                            # punto siempre a la izquierda (la X leia el
-                            # contador), el punto nunca se borraba al soltar
-                            # (el flag up caia en otro byte) y el 0.1.8 se
-                            # movia solo (el contador avanzando movia la X
-                            # fantasma). Por eso se escribe ahora el buffer
-                            # de 63 bytes directamente, en offsets
-                            # empaquetados, copiando los campos ya calculados
-                            # arriba. (& 0xFF porque los c_byte del struct
-                            # se leen con signo.)
-                            _pk = bytearray(63)
-                            _pk[0] = _r.bThumbLX & 0xFF
-                            _pk[1] = _r.bThumbLY & 0xFF
-                            _pk[2] = _r.bThumbRX & 0xFF
-                            _pk[3] = _r.bThumbRY & 0xFF
-                            _pk[4] = _r.wButtons & 0xFF
-                            _pk[5] = (_r.wButtons >> 8) & 0xFF
-                            _pk[6] = _r.bSpecial & 0xFF
-                            _pk[7] = _r.bTriggerL & 0xFF
-                            _pk[8] = _r.bTriggerR & 0xFF
-                            # 9-10 timestamp: 0 (no se reenvia)
-                            _pk[11] = _r.bBatteryLvl & 0xFF
-                            # 12-23 gyro/accel: 0 (no se reenvian)
-                            # 24-28 unknown1: 0
-                            _pk[29] = _r.bBatteryLvlSpecial & 0xFF
-                            # 30-31 unknown2: 0
-                            _pk[32] = _r.bTouchPacketsN & 0xFF
-                            _pk[33] = _cur.bPacketCounter & 0xFF
-                            _pk[34] = _cur.bIsUpTrackingNum1 & 0xFF
-                            _pk[35] = _cur.bTouchData1[0] & 0xFF
-                            _pk[36] = _cur.bTouchData1[1] & 0xFF
-                            _pk[37] = _cur.bTouchData1[2] & 0xFF
-                            _pk[38] = _cur.bIsUpTrackingNum2 & 0xFF
-                            _pk[39] = _cur.bTouchData2[0] & 0xFF
-                            _pk[40] = _cur.bTouchData2[1] & 0xFF
-                            _pk[41] = _cur.bTouchData2[2] & 0xFF
-                            # 42-59 previous touches: ceros (DS4Windows)
-                            # 60-62: 0
-                            _ex.ReportBuffer[:] = bytes(_pk)
-                            pad.update_extended_report(_ex)
-                            _sent_ex = True
-                        except ImportError:
-                            self._vcom = False
-                        except Exception as _ex_err:
-                            # Ya no tragarse el fallo en silencio: la primera
-                            # vez queda en debug_hid.log para cazarlo.
-                            if not getattr(self, "_ex_fail_logged", False):
-                                self._ex_fail_logged = True
-                                try:
-                                    HidHideController._cloak_debug(f"EX FAIL: {_ex_err!r}")
-                                except Exception:
-                                    pass
-                    if not _sent_ex:
+                        pad.left_trigger(value=st["L2"])
+                        pad.right_trigger(value=st["R2"])
+                        pad.left_joystick(x_value=int(lx_f * 32767), y_value=int(ly_f * 32767))
+                        pad.right_joystick(x_value=int(rx_f * 32767), y_value=int(ry_f * 32767))
                         pad.update()
-                    # Log de diagnóstico (post-hoc, no toca el input): al
-                    # soltar el dedo, escribe la trayectoria del gesto para
-                    # ver qué recibió el juego (dirección real vs la que el
-                    # juego interpretó).
-                    if _was and not _touching:
-                        try:
-                            _traj = getattr(self, "_ex_traj", None) or []
-                            _dx0 = getattr(self, "_ex_down_x", 0)
-                            _dy0 = getattr(self, "_ex_down_y", 0)
-                            _fx = getattr(self, "_ex_last_x", 0)
-                            _fy = getattr(self, "_ex_last_y", 0)
-                            _lines = [f"gesto: inicio=({_dx0},{_dy0}) fin=({_fx},{_fy}) dx={_fx - _dx0} dy={_fy - _dy0} frames={len(_traj)} clic={'SI' if getattr(self, '_ex_traj_clicked', False) else 'NO'} ex={'SI' if _sent_ex else 'NO'}"]
-                            for _t, _ax, _ay, _bx, _by in _traj:
-                                _lines.append(f"  t={_t} x={_ax} y={_ay} rep=({_bx},{_by})")
-                            with open(os.path.join(BASE_DIR, "touch_log.txt"), "a", encoding="utf-8") as _f:
-                                _f.write("\n".join(_lines) + "\n")
-                        except Exception:
-                            pass
-                        self._ex_traj = []
+
+                    elif pad and self.emulation_type == "DS4":
+                        pad.reset()
+                        if st["cross"]:
+                            pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_CROSS)
+                        if st["circle"]:
+                            pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_CIRCLE)
+                        if st["square"]:
+                            pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_SQUARE)
+                        if st["triangle"]:
+                            pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_TRIANGLE)
+                        if st["L1"]:
+                            pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_SHOULDER_LEFT)
+                        if st["R1"]:
+                            pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_SHOULDER_RIGHT)
+                        if st["share"]:
+                            pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_SHARE)
+                        if st["options"]:
+                            pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_OPTIONS)
+                        if st["L3"]:
+                            pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_THUMB_LEFT)
+                        if st["R3"]:
+                            pad.press_button(vg.DS4_BUTTONS.DS4_BUTTON_THUMB_RIGHT)
+                        if st["ps"]:
+                            pad.press_special_button(vg.DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_PS)
+                        # Touchpad: clic pass-through al juego solo si el modo
+                        # ratón está apagado (si está encendido, el touchpad
+                        # mueve el cursor, comportamiento elegido por el usuario).
+                        # En modo X360 no hay touchpad que pasar (el mando Xbox
+                        # no tiene); la posición del dedo no la expone vgamepad
+                        # (solo el clic), así que solo va el clic.
+                        if st["touch_btn"] and not _snap.get("touch_on", False):
+                            pad.press_special_button(vg.DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_TOUCHPAD)
+                        # D-pad (hat): combinar las 4 direcciones (con diagonales).
+                        _up, _down, _left, _right = st["up"], st["down"], st["left"], st["right"]
+                        if _up and _right:
+                            pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTHEAST)
+                        elif _right and _down:
+                            pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_SOUTHEAST)
+                        elif _down and _left:
+                            pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_SOUTHWEST)
+                        elif _left and _up:
+                            pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTHWEST)
+                        elif _up:
+                            pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTH)
+                        elif _right:
+                            pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_EAST)
+                        elif _down:
+                            pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_SOUTH)
+                        elif _left:
+                            pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_WEST)
+                        else:
+                            pad.directional_pad(vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NONE)
+
+                        pad.left_trigger(value=st["L2"])
+                        pad.right_trigger(value=st["R2"])
+                        pad.left_joystick(x_value=int((lx_f + 1.0) * 127.5), y_value=int((-ly_f + 1.0) * 127.5))
+                        pad.right_joystick(x_value=int((rx_f + 1.0) * 127.5), y_value=int((-ry_f + 1.0) * 127.5))
+                        # Touchpad: pass-through de POSICIÓN vía reporte extendido
+                        # DS4 (vgamepad no expone posición; solo el clic). Si algo
+                        # falla, se cae al update() normal (sin posición, pero con
+                        # todo el input intacto). Solo modo DS4; en X360 no hay
+                        # touchpad que pasar.
+                        _sent_ex = False
+                        _vcom = getattr(self, "_vcom", None)
+                        if _vcom is not False:
+                            try:
+                                if _vcom is None:
+                                    from vgamepad.win import vigem_commons as _vcom
+                                    self._vcom = _vcom
+                                # vgamepad 0.1.0: c_byte ES c_ubyte (SIN signo,
+                                # verificado en el fuente del tag v0.1.0).
+                                # El _sb viejo restaba 256 y mandaba valores
+                                # negativos a campos unsigned: ctypes lo
+                                # rechazaba, el bloque entero fallaba en
+                                # silencio y el reporte extendido NUNCA se
+                                # enviaba (por eso la bateria nunca llegaba
+                                # a Steam y quedaba en 5%, y el touchpad
+                                # tampoco pasaba). Bytes crudos 0-255.
+                                _sb = lambda v: v & 0xFF
+                                _ex = _vcom.DS4_REPORT_EX()
+                                _r = _ex.Report
+                                _r.bThumbLX = pad.report.bThumbLX
+                                _r.bThumbLY = pad.report.bThumbLY
+                                _r.bThumbRX = pad.report.bThumbRX
+                                _r.bThumbRY = pad.report.bThumbRY
+                                _r.wButtons = pad.report.wButtons
+                                _r.bSpecial = pad.report.bSpecial
+                                _r.bTriggerL = pad.report.bTriggerL
+                                _r.bTriggerR = pad.report.bTriggerR
+                                # BATERIA (FIX v0.1.8, 2026-11-10): Steam/SDL NO
+                                # lee la bateria de bBatteryLvl (byte 12), sino
+                                # de bBatteryLvlSpecial (byte 30, nibble 0-10,
+                                # bit 0x10 = cargando). Por eso Steam mostraba
+                                # siempre 5% (= 0*10+5): ese byte quedaba en 0.
+                                # DS4Windows solo escribe bBatteryLvlSpecial.
+                                # Se escribe el nibble en AMBOS campos.
+                                _bn = st.get("batt_nibble")
+                                if _bn is not None:
+                                    _bn = max(0, min(10, int(_bn)))
+                                    _r.bBatteryLvl = _bn
+                                    _r.bBatteryLvlSpecial = _bn
+                                    if st.get("batt_charging"):
+                                        _r.bBatteryLvl |= 0x10
+                                        _r.bBatteryLvlSpecial |= 0x10
+                                _touching = bool(st["touch_active"]) and not _snap.get("touch_on", False)
+                                _was = getattr(self, "_ex_touch_prev_active", False)
+                                if _touching and not _was:
+                                    self._ex_touch_id = (getattr(self, "_ex_touch_id", 0) + 1) & 0x7F
+                                    self._ex_down_t = time.time()
+                                    self._ex_traj = []
+                                    self._ex_traj_clicked = False
+                                if _touching:
+                                    _rx = max(0, min(1919, int(st["touch_x"])))
+                                    # Reescala Y: el DualSense reporta 0-1079 y la
+                                    # superficie DS4 es 0-941. Sin reescala, la
+                                    # vertical salia ~15% caliente y el clamp en
+                                    # 943 dejaba pasar valores fuera de rango.
+                                    _ry = max(0, min(941, int(round(int(st["touch_y"]) * 941 / 1079))))
+                                    if not _was:
+                                        self._ex_down_x, self._ex_down_y = _rx, _ry
+                                    # Sin zona muerta: congelar en el punto de
+                                    # apoyo y soltar de golpe crea los saltos que
+                                    # el juego leia como gestos.
+                                    _tx, _ty = _rx, _ry
+                                    self._ex_last_x, self._ex_last_y = _tx, _ty
+                                    if st.get("touch_btn"):
+                                        self._ex_traj_clicked = True
+                                    _traj = getattr(self, "_ex_traj", None)
+                                    if _traj is not None and len(_traj) < 5000:
+                                        _traj.append((int((time.time() - getattr(self, "_ex_down_t", time.time())) * 1000), _rx, _ry, _tx, _ty))
+                                else:
+                                    _tx = getattr(self, "_ex_last_x", 0)
+                                    _ty = getattr(self, "_ex_last_y", 0)
+                                # FIX v0.1.8 (2026-11-10): el contador de paquetes
+                                # del touch AVANZA EN CADA FRAME, tocando o no,
+                                # como el contador del hardware que DS4Windows
+                                # reenvia tal cual. Congelarlo en reposo (0.1.7)
+                                # era la unica diferencia que quedaba con la
+                                # referencia, y Steam ignoraba los paquetes con
+                                # el contador repetido, asi que nunca veia el
+                                # flag up y el punto se quedaba pegado.
+                                _tid = getattr(self, "_ex_touch_id", 0) & 0x7F
+                                _cur = _r.sCurrentTouch
+                                self._ex_touch_counter = (getattr(self, "_ex_touch_counter", 0) + 1) & 0xFF
+                                _cur.bPacketCounter = _sb(self._ex_touch_counter)
+                                if _touching:
+                                    _cur.bIsUpTrackingNum1 = _sb(_tid)
+                                    _cur.bTouchData1[0] = _sb(_tx & 0xFF)
+                                    _cur.bTouchData1[1] = _sb(((_tx >> 8) & 0x0F) | ((_ty & 0x0F) << 4))
+                                    _cur.bTouchData1[2] = _sb((_ty >> 4) & 0xFF)
+                                    _r.bTouchPacketsN = 1
+                                else:
+                                    _cur.bIsUpTrackingNum1 = _sb(_tid | 0x80)
+                                    _cur.bTouchData1[0] = _sb(_tx & 0xFF)
+                                    _cur.bTouchData1[1] = _sb(((_tx >> 8) & 0x0F) | ((_ty & 0x0F) << 4))
+                                    _cur.bTouchData1[2] = _sb((_ty >> 4) & 0xFF)
+                                    _r.bTouchPacketsN = 1
+                                _cur.bIsUpTrackingNum2 = _sb(0x80)
+                                _cur.bTouchData2[0] = 0
+                                _cur.bTouchData2[1] = 0
+                                _cur.bTouchData2[2] = 0
+                                # Previous: patron "sin uso" siempre (con N=1 no
+                                # hay historia real; ceros serian un toque DOWN
+                                # en (0,0) con ID 0).
+                                for _p in (_r.sPreviousTouch[0], _r.sPreviousTouch[1]):
+                                    _p.bPacketCounter = 0
+                                    _p.bIsUpTrackingNum1 = _sb(0x80)
+                                    _p.bTouchData1[0] = 0
+                                    _p.bTouchData1[1] = 0
+                                    _p.bTouchData1[2] = 0
+                                    _p.bIsUpTrackingNum2 = _sb(0x80)
+                                    _p.bTouchData2[0] = 0
+                                    _p.bTouchData2[1] = 0
+                                    _p.bTouchData2[2] = 0
+                                self._ex_touch_prev_active = _touching
+                                # FIX v0.1.9 (2026-11-10) — RAIZ DE TODO: vgamepad
+                                # 0.1.0 define DS4_REPORT_EX con alineacion por
+                                # defecto (72 bytes, DS4_TOUCH de 12 bytes), pero
+                                # ViGEm (pshpack1.h en Common.h) lo define
+                                # EMPAQUETADO (63 bytes, DS4_TOUCH de 9). El
+                                # cliente ViGEm copia 63 bytes del buffer y el
+                                # driver los lee como empaquetado, asi que todos
+                                # los campos desde el timestamp quedaban corridos
+                                # un byte o mas. Eso explica TODO lo visto: la
+                                # bateria siempre 5% (el byte 30 leia un 0), el
+                                # punto siempre a la izquierda (la X leia el
+                                # contador), el punto nunca se borraba al soltar
+                                # (el flag up caia en otro byte) y el 0.1.8 se
+                                # movia solo (el contador avanzando movia la X
+                                # fantasma). Por eso se escribe ahora el buffer
+                                # de 63 bytes directamente, en offsets
+                                # empaquetados, copiando los campos ya calculados
+                                # arriba. (& 0xFF porque los c_byte del struct
+                                # se leen con signo.)
+                                _pk = bytearray(63)
+                                _pk[0] = _r.bThumbLX & 0xFF
+                                _pk[1] = _r.bThumbLY & 0xFF
+                                _pk[2] = _r.bThumbRX & 0xFF
+                                _pk[3] = _r.bThumbRY & 0xFF
+                                _pk[4] = _r.wButtons & 0xFF
+                                _pk[5] = (_r.wButtons >> 8) & 0xFF
+                                _pk[6] = _r.bSpecial & 0xFF
+                                _pk[7] = _r.bTriggerL & 0xFF
+                                _pk[8] = _r.bTriggerR & 0xFF
+                                # 9-10 timestamp: 0 (no se reenvia)
+                                _pk[11] = _r.bBatteryLvl & 0xFF
+                                # 12-23 gyro/accel: 0 (no se reenvian)
+                                # 24-28 unknown1: 0
+                                _pk[29] = _r.bBatteryLvlSpecial & 0xFF
+                                # 30-31 unknown2: 0
+                                _pk[32] = _r.bTouchPacketsN & 0xFF
+                                _pk[33] = _cur.bPacketCounter & 0xFF
+                                _pk[34] = _cur.bIsUpTrackingNum1 & 0xFF
+                                _pk[35] = _cur.bTouchData1[0] & 0xFF
+                                _pk[36] = _cur.bTouchData1[1] & 0xFF
+                                _pk[37] = _cur.bTouchData1[2] & 0xFF
+                                _pk[38] = _cur.bIsUpTrackingNum2 & 0xFF
+                                _pk[39] = _cur.bTouchData2[0] & 0xFF
+                                _pk[40] = _cur.bTouchData2[1] & 0xFF
+                                _pk[41] = _cur.bTouchData2[2] & 0xFF
+                                # 42-59 previous touches: ceros (DS4Windows)
+                                # 60-62: 0
+                                _ex.ReportBuffer[:] = bytes(_pk)
+                                pad.update_extended_report(_ex)
+                                _sent_ex = True
+                            except ImportError:
+                                self._vcom = False
+                            except Exception as _ex_err:
+                                # Ya no tragarse el fallo en silencio: la primera
+                                # vez queda en debug_hid.log para cazarlo.
+                                if not getattr(self, "_ex_fail_logged", False):
+                                    self._ex_fail_logged = True
+                                    try:
+                                        HidHideController._cloak_debug(f"EX FAIL: {_ex_err!r}")
+                                    except Exception:
+                                        pass
+                        if not _sent_ex:
+                            pad.update()
+                        # Log de diagnóstico (post-hoc, no toca el input): al
+                        # soltar el dedo, escribe la trayectoria del gesto para
+                        # ver qué recibió el juego (dirección real vs la que el
+                        # juego interpretó).
+                        if _was and not _touching:
+                            try:
+                                _traj = getattr(self, "_ex_traj", None) or []
+                                _dx0 = getattr(self, "_ex_down_x", 0)
+                                _dy0 = getattr(self, "_ex_down_y", 0)
+                                _fx = getattr(self, "_ex_last_x", 0)
+                                _fy = getattr(self, "_ex_last_y", 0)
+                                _lines = [f"gesto: inicio=({_dx0},{_dy0}) fin=({_fx},{_fy}) dx={_fx - _dx0} dy={_fy - _dy0} frames={len(_traj)} clic={'SI' if getattr(self, '_ex_traj_clicked', False) else 'NO'} ex={'SI' if _sent_ex else 'NO'}"]
+                                for _t, _ax, _ay, _bx, _by in _traj:
+                                    _lines.append(f"  t={_t} x={_ax} y={_ay} rep=({_bx},{_by})")
+                                _append_log_capped(os.path.join(BASE_DIR, "touch_log.txt"),
+                                                   "\n".join(_lines) + "\n")
+                            except Exception:
+                                pass
+                            self._ex_traj = []
 
                 # FIX 6: solo escribe al control si config o rumble cambiaron
-                ui_st = self.collect_ui_state()
+                # Foto de la UI (hilo principal); el worker nunca lee widgets.
+                ui_st = self._ui_snap
+                if ui_st is None:
+                    # Sin foto todavía: gatillos y luz apagados en este frame.
+                    ui_st = {"l2_mode": "Desactivado", "l2_start": 0, "l2_end": 0,
+                             "l2_force": 0, "r2_mode": "Desactivado", "r2_start": 0,
+                             "r2_end": 0, "r2_force": 0, "lightbar": [0, 0, 0]}
                 if not getattr(self, "_profile_active", True):
                     # Sin perfil activo: gatillos desactivados, rumble y luz vivos.
                     ui_st = dict(ui_st)
@@ -4763,12 +6262,17 @@ class DualSenseStudioApp(ctk.CTk):
                     self._last_sig = sig
                     last_heartbeat = now
             else:
-                # read_state() falló: posible desconexión física
-                read_failures += 1
-                if read_failures > 100:  # ~0.5s de fallos continuos
+                # FIX v0.1.16 (GPT plan 3): separar lecturas VACIAS
+                # (sin reporte listo, no es desconexion) de errores
+                # reales. Solo errores/invalidos cuentan: una rafaga
+                # de vacias ya no tumba el servicio.
+                _kind = getattr(self.hw, "_last_read_kind", "error")
+                if _kind != "empty":
+                    read_failures += 1
+                if read_failures > 500:  # FIX v0.1.15 punto 21: ~2,5 s de fallos continuos (antes 100, ~0,5 s: un micro-corte de BT desmontaba todo el servicio). Un corte real se nota 2 s más tarde; un micro-corte ya no tumba nada.
                     self.hw.connected = False
                     try:
-                        self.after(0, self._on_device_lost)
+                        self.after(0, lambda _gen=getattr(self, "_service_gen", 0): self._on_device_lost(_gen))
                     except Exception:
                         pass
                     break
