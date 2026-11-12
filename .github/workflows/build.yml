@@ -98,3 +98,20 @@ jobs:
           $exe = Get-Item dist\DualSenseStudio.exe
           if ($exe.Length -lt 1000000) { Write-Error "El exe salió demasiado chico."; exit 1 }
           Write-Host "Exe OK: $($exe.Length) bytes"
+      - name: Guardar el exe como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: DualSenseStudio-exe
+          path: dist/DualSenseStudio.exe
+          if-no-files-found: error
+
+      - name: Subir el exe al release (borrador)
+        if: steps.tag.outputs.tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.tag.outputs.tag }}"
+          gh release view $tag --json tagName 2>$null
+          if ($LASTEXITCODE -ne 0) { gh release create $tag --draft --title $tag --notes "Build automático." }
+          gh release upload $tag dist\DualSenseStudio.exe --clobber
