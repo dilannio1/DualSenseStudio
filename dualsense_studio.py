@@ -45,6 +45,11 @@ FIX 12: caza del byte de DUREZA real: Personalizado expone los bytes
         reporta cuál responde; luego se cablea como dureza.
 FIX 13: pulseOptions del lightbar era 0x02 (FadeOut) y apagaba el color.
         Ahora 0x00 (Off, default verificado de pydualsense) = color solido.
+FIX 14 (v0.1.19, delay): el loop dormia 5 ms entre vueltas (~170 Hz) y
+        leia un solo reporte por vuelta: cada entrada esperaba ~3 ms de
+        media a que la leyeran, y por USB (250 Hz) los reportes se
+        acumulaban y el juego veia entradas atrasadas. Ahora duerme 1 ms
+        (~1000 Hz) y drena la cola quedandose con el reporte mas fresco.
 
 Requiere en Windows: Python 3.10+, ViGEmBus driver, y:
     pip install -r requirements.txt
@@ -63,7 +68,7 @@ import subprocess
 import re
 import urllib.request
 
-OTA_VERSION = "0.1.18"
+OTA_VERSION = "0.1.19"
 # FIX v0.1.13 (versiones inconsistentes, GPT tenia razon: habia 3
 # identificadores para la misma compilacion — APP_VERSION "v2.7",
 # OTA_VERSION "0.1.12" y BUILD_TAG "ota-v3"): las dos etiquetas que se
@@ -5771,6 +5776,17 @@ class DualSenseStudioApp(ctk.CTk):
 
         while self.running_thread and self.hw.connected:
             st = self.hw.read_state()
+            # FIX v0.1.19 (delay): drenar reportes encolados y quedarse
+            # con el mas fresco. Si el mando manda mas rapido que el loop
+            # (USB 250 Hz), los reportes viejos se acumulaban y el juego
+            # veia entradas atrasadas. Tope 32 para no atascarse si la
+            # cola no se vacia nunca. Un None = cola vacia, no es fallo.
+            if st is not None:
+                for _ in range(32):
+                    _nxt = self.hw.read_state()
+                    if _nxt is None:
+                        break
+                    st = _nxt
             if st:
                 read_failures = 0  # Reset al leer bien
                 # NAVEGACIÓN POR CONTROL (cuadros de perfil): si un cuadro
@@ -6277,7 +6293,11 @@ class DualSenseStudioApp(ctk.CTk):
                         pass
                     break
 
-            time.sleep(0.005)
+            # FIX v0.1.19 (delay): dormir 1 ms en vez de 5 ms: el loop
+            # corre a ~1000 Hz y cada reporte espera ~0.5 ms a que lo
+            # lean, en vez de ~3 ms. Sin esto, por Bluetooth se sentia
+            # el mando pesado al emular.
+            time.sleep(0.001)
 
 
 if __name__ == "__main__":
