@@ -64,6 +64,11 @@ FIX 15 (v0.1.20, OTA rota): la actualizacion a 0.1.19 moria al arrancar
         que actualiza (la vieja), asi que desde 0.1.18/0.1.19 la OTA
         sigue rota: hay que instalar 0.1.20 a mano una vez; desde ahi
         la OTA vuelve a funcionar.
+FIX 16 (v0.1.21, bateria de 10 en 10): el % mostraba el punto medio
+        (nivel*10+5: 5,15,...,75,85,95,100) y se saltaba los redondos
+        (de 75 subia a 85 sin pasar por 80). Ahora el piso (nivel*10):
+        0,10,...,70,80,90,100, igual que Steam/Windows. Solo cambia
+        el numero mostrado; al DS4 virtual sigue yendo el nibble 0-10.
 
 Requiere en Windows: Python 3.10+, ViGEmBus driver, y:
     pip install -r requirements.txt
@@ -82,7 +87,7 @@ import subprocess
 import re
 import urllib.request
 
-OTA_VERSION = "0.1.20"
+OTA_VERSION = "0.1.21"
 # FIX v0.1.13 (versiones inconsistentes, GPT tenia razon: habia 3
 # identificadores para la misma compilacion — APP_VERSION "v2.7",
 # OTA_VERSION "0.1.12" y BUILD_TAG "ota-v3"): las dos etiquetas que se
@@ -1842,7 +1847,14 @@ class DualSenseHardware:
             if _chg == 2:
                 _lvl, _nib, _chg_flag = 100, 10, False
             elif _chg in (0, 1) and _lvl_nib <= 10:
-                _lvl = min(_lvl_nib * 10 + 5, 100)
+                # FIX v0.1.21 (bateria de 10 en 10): antes el punto medio
+                # (nivel*10+5) mostraba 5,15,...,75,85,95 y se saltaba
+                # los redondos (de 75 subia a 85 sin pasar por 80).
+                # Ahora el piso (nivel*10): 0,10,...,70,80,90,100,
+                # igual que Steam/Windows. Solo cambia el numero que se
+                # muestra; al DS4 virtual se le sigue mandando el nibble
+                # crudo (0-10), asi que Steam no cambia.
+                _lvl = _lvl_nib * 10
                 _nib = _lvl_nib  # 0-10, escala DS4: se reenvia tal cual al DS4 virtual
                 _chg_flag = (_chg == 1)
         if _nib is None and getattr(self, "_last_batt", None) is not None:
