@@ -50,6 +50,20 @@ FIX 14 (v0.1.19, delay): el loop dormia 5 ms entre vueltas (~170 Hz) y
         media a que la leyeran, y por USB (250 Hz) los reportes se
         acumulaban y el juego veia entradas atrasadas. Ahora duerme 1 ms
         (~1000 Hz) y drena la cola quedandose con el reporte mas fresco.
+FIX 15 (v0.1.20, OTA rota): la actualizacion a 0.1.19 moria al arrancar
+        con "Security validation failure: invalid originating onefile
+        parent process (PID not found)". Causa: PyInstaller >=6.9 trata
+        un proceso lanzado desde la misma app como trabajador que reusa
+        recursos, y >=6.22.1 valida el PID del proceso padre onefile.
+        El .bat del actualizador heredaba las variables internas del
+        exe viejo (ya muerto) y se las pasaba al exe nuevo, que lo
+        rechazaba. Solucion (documentada por PyInstaller): poner
+        PYINSTALLER_RESET_ENVIRONMENT=1 al lanzar el .bat y dentro del
+        .bat antes de relanzar el exe, para que el exe nuevo arranque
+        como instancia independiente. OJO: el arreglo vive en la version
+        que actualiza (la vieja), asi que desde 0.1.18/0.1.19 la OTA
+        sigue rota: hay que instalar 0.1.20 a mano una vez; desde ahi
+        la OTA vuelve a funcionar.
 
 Requiere en Windows: Python 3.10+, ViGEmBus driver, y:
     pip install -r requirements.txt
@@ -68,7 +82,7 @@ import subprocess
 import re
 import urllib.request
 
-OTA_VERSION = "0.1.19"
+OTA_VERSION = "0.1.20"
 # FIX v0.1.13 (versiones inconsistentes, GPT tenia razon: habia 3
 # identificadores para la misma compilacion — APP_VERSION "v2.7",
 # OTA_VERSION "0.1.12" y BUILD_TAG "ota-v3"): las dos etiquetas que se
@@ -213,6 +227,12 @@ def _ota_updater_script(exe_path, new_path, proc_name, bak_path=None):
     marker_path = os.path.join(os.path.dirname(exe_path) or ".", "actualizacion_arranque_ok.txt")
     lines = [
         "@echo off",
+        "REM FIX v0.1.20 (OTA rota, PyInstaller >=6.9/6.22.1): el exe nuevo",
+        "REM debe arrancar como instancia independiente. Sin esto, el .bat",
+        "REM hereda las variables internas onefile del exe viejo (ya muerto)",
+        "REM y el exe nuevo muere con 'invalid originating onefile parent",
+        "REM process (PID not found)'.",
+        "set \"PYINSTALLER_RESET_ENVIRONMENT=1\"",
         "REM Actualizador de DualSense Studio: reemplaza el exe y relanza.",
         "echo [%date% %time%] Actualizador iniciado.",
         "set \"intentos=0\"",
@@ -3977,17 +3997,22 @@ class DualSenseStudioApp(ctk.CTk):
         # DETACHED_PROCESS: sin consola el `timeout` del .bat fallaba) y
         # guardar la salida del actualizador en actualizar_log.txt para
         # poder diagnosticar si vuelve a fallar.
+        # FIX v0.1.20 (OTA rota): el .bat debe nacer con
+        # PYINSTALLER_RESET_ENVIRONMENT=1 para que el exe nuevo arranque
+        # como instancia independiente (ver _ota_updater_script).
         _log_path = os.path.join(BASE_DIR, "actualizar_log.txt")
         try:
             _log_f = open(_log_path, "wb")
             try:
                 subprocess.Popen(["cmd", "/c", bat_path], stdout=_log_f,
                                  stderr=subprocess.STDOUT,
+                                 env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"},
                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             finally:
                 _log_f.close()
         except Exception:
-            subprocess.Popen(["cmd", "/c", bat_path])
+            subprocess.Popen(["cmd", "/c", bat_path],
+                             env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})
         self.after(0, self._ota_teardown_and_quit)
 
     def _ota_teardown_and_quit(self):
